@@ -47,6 +47,13 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudioOut>")
     endif()
 
+    if(NOT WIN32)
+        add_test_executable(audio_out_signal_pacing_tests tests/AudioOutSignalPacing.cpp)
+        target_include_directories(audio_out_signal_pacing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(audio_out_signal_pacing_tests PRIVATE libSceAudioOut libkernel libc)
+        add_test(NAME audio_out_signal_pacing COMMAND audio_out_signal_pacing_tests)
+    endif()
+
     add_test_executable(audio_out2_latency_tests tests/AudioOut2Latency.cpp)
     target_include_directories(audio_out2_latency_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(audio_out2_latency_tests PRIVATE libSceAudioOut libc)
