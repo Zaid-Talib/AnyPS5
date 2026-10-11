@@ -3,8 +3,12 @@
 #include "IntermediateRepresentation/IrValue.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
+#include <algorithm>
+#include <array>
 #include <initializer_list>
+#include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -49,19 +53,17 @@ std::uint32_t CompareOrdered64(SpirvEmitterState& state, std::uint32_t lhsValue,
 }
 
 std::uint32_t EmitMulHigh(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool signedValue) {
-    const auto operandType = signedValue ? TypeI32(state) : TypeU32(state);
-    const auto pairType = signedValue ? TypeI32Pair(state) : TypeU32Pair(state);
-    auto lhsOperand = lhs;
-    auto rhsOperand = rhs;
-    if (signedValue) {
-        lhsOperand = Unary(state, spv::OpBitcast, TypeI32(state), lhs);
-        rhsOperand = Unary(state, spv::OpBitcast, TypeI32(state), rhs);
-    }
+    const auto pairType = TypeU32Pair(state);
     const auto extended = state.module.AllocateId();
-    state.module.AddFunction(signedValue ? spv::OpSMulExtended : spv::OpUMulExtended, pairType, extended, lhsOperand, rhsOperand);
+    state.module.AddFunction(spv::OpUMulExtended, pairType, extended, lhs, rhs);
     const auto high = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeExtract, operandType, high, extended, 1u);
-    return signedValue ? Unary(state, spv::OpBitcast, TypeU32(state), high) : high;
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, extended, 1u);
+    if (!signedValue) return high;
+    const auto aNeg = Binary(state, spv::OpSLessThan, TypeBool(state), lhs, ConstantU32(state, 0u));
+    const auto bNeg = Binary(state, spv::OpSLessThan, TypeBool(state), rhs, ConstantU32(state, 0u));
+    const auto corrA = Select(state, TypeU32(state), aNeg, rhs, ConstantU32(state, 0u));
+    const auto corrB = Select(state, TypeU32(state), bNeg, lhs, ConstantU32(state, 0u));
+    return Binary(state, spv::OpISub, TypeU32(state), high, Binary(state, spv::OpIAdd, TypeU32(state), corrA, corrB));
 }
 
 std::uint32_t EmitShift64(SpirvEmitterState& state, spv::Op opcode, std::uint32_t value, std::uint32_t shift) {
@@ -136,31 +138,6 @@ std::uint32_t EmitExt(SpirvEmitterState& state, std::uint32_t type, std::uint32_
     return result;
 }
 
-std::uint32_t EmitF32ToU32(SpirvEmitterState& state, std::uint32_t src, bool signedValue) {
-    const auto truncated = EmitTruncF32Value(state, src);
-    const auto convertedRaw = state.module.AllocateId();
-    if (signedValue) {
-        const auto convertedSigned = state.module.AllocateId();
-        state.module.AddFunction(spv::OpConvertFToS, TypeI32(state), convertedSigned, truncated);
-        state.module.AddFunction(spv::OpBitcast, TypeU32(state), convertedRaw, convertedSigned);
-    } else {
-        state.module.AddFunction(spv::OpConvertFToU, TypeU32(state), convertedRaw, truncated);
-    }
-    const auto nan = EmitClassifyF32(state, src).nan;
-    if (signedValue) {
-        const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src, ConstantF32(state, 0xcf000000u));
-        const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src, ConstantF32(state, 0x4f000000u));
-        const auto high = Select(state, TypeU32(state), above, ConstantU32(state, 0x7fffffffu), convertedRaw);
-        const auto low = Select(state, TypeU32(state), below, ConstantU32(state, 0x80000000u), high);
-        return Select(state, TypeU32(state), nan, ConstantU32(state, 0u), low);
-    }
-    const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src, ConstantF32(state, 0u));
-    const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src, ConstantF32(state, 0x4f800000u));
-    const auto zero = Binary(state, spv::OpLogicalOr, TypeBool(state), nan, below);
-    const auto high = Select(state, TypeU32(state), above, ConstantU32(state, 0xffffffffu), convertedRaw);
-    return Select(state, TypeU32(state), zero, ConstantU32(state, 0u), high);
-}
-
 std::uint32_t EmitDppWriteCondition(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto flags = inst.Flags<DppMoveFlags>();
@@ -226,6 +203,249 @@ bool HostSubgroupNarrowerThanWave(const SpirvEmitterState& state) {
     ctx.Fail(inst, (access + " is outside the " + std::to_string(state.hostSubgroupSize) + "-lane host subgroup that runs this wave" + std::to_string(state.program.WaveSize()) + " program at one lane per invocation").c_str());
 }
 
+struct WaveReduction {
+    IrOpcode opcode;
+    std::uint32_t identity;
+    spv::Op reduce;
+    bool floating = false;
+};
+
+constexpr std::array<WaveReduction, 9> WaveReductions{{
+    {IrOpcode::UMin32, 0xffffffffu, spv::OpGroupNonUniformUMin},
+    {IrOpcode::UMax32, 0u, spv::OpGroupNonUniformUMax},
+    {IrOpcode::SMin32, 0x7fffffffu, spv::OpGroupNonUniformSMin},
+    {IrOpcode::SMax32, 0x80000000u, spv::OpGroupNonUniformSMax},
+    {IrOpcode::IAdd32, 0u, spv::OpGroupNonUniformIAdd},
+    {IrOpcode::BitwiseAnd32, 0xffffffffu, spv::OpGroupNonUniformBitwiseAnd},
+    {IrOpcode::BitwiseOr32, 0u, spv::OpGroupNonUniformBitwiseOr},
+    {IrOpcode::FPMin32, 0x7f800000u, spv::OpNop, true},
+    {IrOpcode::FPMax32, 0xff800000u, spv::OpNop, true},
+}};
+
+struct HalfWaveScan {
+    const WaveReduction* reduction = nullptr;
+    const IrValue* source = nullptr;
+};
+
+const IrValue* Resolved(const IrValue* value) {
+    return value != nullptr ? value->Resolve() : nullptr;
+}
+
+bool Is(const IrValue* value, IrOpcode opcode) {
+    return value != nullptr && !value->HasImmediate() && value->Opcode() == opcode;
+}
+
+bool IsU32(const IrValue* value, std::uint32_t expected) {
+    const auto* resolved = Resolved(value);
+    return resolved != nullptr && resolved->HasImmediate() && resolved->Type() == IrType::U32 && resolved->ImmediateU32() == expected;
+}
+
+template<typename TMatch>
+bool EitherOrder(const IrValue* value, TMatch&& match) {
+    return match(Resolved(value->Argument(0)), Resolved(value->Argument(1))) || match(Resolved(value->Argument(1)), Resolved(value->Argument(0)));
+}
+
+template<typename TMatch>
+bool EitherOrder(const std::array<const IrValue*, 2>& operands, TMatch&& match) {
+    return match(operands[0], operands[1]) || match(operands[1], operands[0]);
+}
+
+std::optional<std::array<const IrValue*, 2>> LaneBitWords(const IrValue* bit) {
+    const IrValue* masked = nullptr;
+    const IrValue* shifted = nullptr;
+    if (!Is(bit, IrOpcode::INotEqual32) || !EitherOrder(bit, [&](const IrValue* value, const IrValue* zero) { masked = value; return IsU32(zero, 0u) && Is(value, IrOpcode::BitwiseAnd32); })) return std::nullopt;
+    if (!EitherOrder(masked, [&](const IrValue* value, const IrValue* one) { shifted = value; return IsU32(one, 1u) && Is(value, IrOpcode::ShiftRightLogical32); })) return std::nullopt;
+    const auto* index = Resolved(shifted->Argument(1));
+    if (!Is(index, IrOpcode::BitwiseAnd32) || !EitherOrder(index, [](const IrValue* lane, const IrValue* mask) { return Is(lane, IrOpcode::LaneId) && IsU32(mask, 31u); })) return std::nullopt;
+    const auto* word = Resolved(shifted->Argument(0));
+    if (!Is(word, IrOpcode::SelectU32)) return std::array<const IrValue*, 2>{word, word};
+    const auto* low = Resolved(word->Argument(0));
+    if (!Is(low, IrOpcode::ULessThan32) || !Is(Resolved(low->Argument(0)), IrOpcode::LaneId) || !IsU32(low->Argument(1), 32u)) return std::nullopt;
+    return std::array<const IrValue*, 2>{Resolved(word->Argument(1)), Resolved(word->Argument(2))};
+}
+
+bool AllOnesWord(const IrValue* word) {
+    if (IsU32(word, 0xffffffffu)) return true;
+    return Is(word, IrOpcode::BitwiseOr32) && EitherOrder(word, [](const IrValue* inverted, const IrValue* other) {
+        return AllOnesWord(inverted) || (Is(inverted, IrOpcode::BitwiseNot32) && Resolved(inverted->Argument(0)) == other);
+    });
+}
+
+bool AllLanesBit(const IrValue* bit) {
+    const auto words = LaneBitWords(Resolved(bit));
+    return words && AllOnesWord((*words)[0]) && AllOnesWord((*words)[1]);
+}
+
+class EntryLaneWalk {
+public:
+    explicit EntryLaneWalk(IrShaderStage stage) : everyInvocationEnters(stage == IrShaderStage::Vertex || stage == IrShaderStage::Local || stage == IrShaderStage::TessellationControl || stage == IrShaderStage::TessellationEvaluation) {}
+
+    bool ZeroBit(const IrValue* bit) {
+        bit = Resolved(bit);
+        if (bit == nullptr || !Spend()) return false;
+        if (bit->HasImmediate()) return bit->Type() == IrType::Bool && !bit->ImmediateBool();
+        if (Is(bit, IrOpcode::LogicalAnd)) return ZeroBit(bit->Argument(0)) || ZeroBit(bit->Argument(1));
+        if (Is(bit, IrOpcode::SelectU1)) return ZeroBit(bit->Argument(1)) && ZeroBit(bit->Argument(2));
+        if (Is(bit, IrOpcode::Phi)) return Incoming(bit, [this](const IrValue* incoming) { return ZeroBit(incoming); });
+        const auto words = LaneBitWords(bit);
+        return words && Word((*words)[0], 0u) && Word((*words)[1], 1u);
+    }
+
+private:
+    bool Spend() {
+        if (budget == 0u) return false;
+        --budget;
+        return true;
+    }
+
+    bool NotHelper(const IrValue* predicate) {
+        predicate = Resolved(predicate);
+        if (predicate == nullptr || !Spend()) return false;
+        if (predicate->HasImmediate()) return everyInvocationEnters && predicate->Type() == IrType::Bool && predicate->ImmediateBool();
+        switch (predicate->Opcode()) {
+            case IrOpcode::LogicalAnd: return NotHelper(predicate->Argument(0)) || NotHelper(predicate->Argument(1));
+            case IrOpcode::IEqual32: return EitherOrder(predicate, [](const IrValue* builtin, const IrValue* zero) { return IsU32(zero, 0u) && Is(builtin, IrOpcode::GetBuiltin) && IsU32(builtin->Argument(0), static_cast<std::uint32_t>(StageInputKind::HelperInvocation)) && IsU32(builtin->Argument(1), 0u); });
+            default: return ZeroBit(predicate);
+        }
+    }
+
+    bool Word(const IrValue* word, std::uint32_t half) {
+        word = Resolved(word);
+        if (word == nullptr || !Spend()) return false;
+        if (word->HasImmediate()) return IsU32(word, 0u);
+        switch (word->Opcode()) {
+            case IrOpcode::CompositeExtractU32x4: {
+                const auto* ballot = Resolved(word->Argument(0));
+                return IsU32(word->Argument(1), half) && Is(ballot, IrOpcode::Ballot) && NotHelper(ballot->Argument(0));
+            }
+            case IrOpcode::CompositeExtractU64: return IsU32(word->Argument(1), half) && Word64(word->Argument(0), half);
+            case IrOpcode::BitwiseAnd32: return Word(word->Argument(0), half) || Word(word->Argument(1), half);
+            case IrOpcode::BitwiseOr32: return Word(word->Argument(0), half) && Word(word->Argument(1), half);
+            case IrOpcode::Phi: return Incoming(word, [this, half](const IrValue* incoming) { return Word(incoming, half); });
+            default: return false;
+        }
+    }
+
+    bool Word64(const IrValue* mask, std::uint32_t half) {
+        mask = Resolved(mask);
+        if (mask == nullptr || !Spend()) return false;
+        if (mask->HasImmediate()) return mask->Type() == IrType::U64 && static_cast<std::uint32_t>(mask->ImmediateU64() >> (32u * half)) == 0u;
+        switch (mask->Opcode()) {
+            case IrOpcode::CompositeConstructU64: return Word(mask->Argument(half), half);
+            case IrOpcode::Phi: return Incoming(mask, [this, half](const IrValue* incoming) { return Word64(incoming, half); });
+            default: return false;
+        }
+    }
+
+    template<typename TCheck>
+    bool Incoming(const IrValue* phi, TCheck&& check) {
+        if (!phis.insert(phi).second) return true;
+        bool result = phi->ArgumentCount() != 0u;
+        for (std::size_t index = 0; result && index < phi->ArgumentCount(); ++index) result = check(phi->Argument(index));
+        phis.erase(phi);
+        return result;
+    }
+
+    bool everyInvocationEnters;
+    std::unordered_set<const IrValue*> phis;
+    std::uint32_t budget = 512u;
+};
+
+bool RowShiftFlags(const IrValue* value, std::uint32_t control) {
+    const auto flags = value->Flags<DppMoveFlags>();
+    return flags.control == control && flags.rowMask == 0xfu && flags.bankMask == 0xfu && !flags.boundControl && !flags.fetchInactive;
+}
+
+const IrValue* Unflushed(const IrValue* value) {
+    if (!Is(value, IrOpcode::SelectU32)) return value;
+    const auto* kept = Resolved(value->Argument(2));
+    const auto masked = [kept](const IrValue* candidate, std::uint32_t mask) {
+        return Is(candidate, IrOpcode::BitwiseAnd32) && EitherOrder(candidate, [&](const IrValue* source, const IrValue* constant) { return source == kept && IsU32(constant, mask); });
+    };
+    const auto* condition = Resolved(value->Argument(0));
+    const bool exponentZero = Is(condition, IrOpcode::IEqual32) && EitherOrder(condition, [&](const IrValue* exponent, const IrValue* zero) { return IsU32(zero, 0u) && masked(exponent, 0x7f800000u); });
+    return exponentZero && masked(Resolved(value->Argument(1)), 0x80000000u) ? kept : value;
+}
+
+std::optional<std::array<const IrValue*, 2>> ReductionOperands(const IrValue* combined, const WaveReduction& reduction) {
+    if (reduction.floating) {
+        combined = Unflushed(combined);
+        if (!Is(combined, IrOpcode::BitCastU32F32)) return std::nullopt;
+        combined = Resolved(combined->Argument(0));
+    }
+    if (!Is(combined, reduction.opcode)) return std::nullopt;
+    std::array<const IrValue*, 2> operands{Resolved(combined->Argument(0)), Resolved(combined->Argument(1))};
+    if (!reduction.floating) return operands;
+    for (auto& operand : operands) {
+        if (!Is(operand, IrOpcode::BitCastF32U32)) return std::nullopt;
+        operand = Unflushed(Resolved(operand->Argument(0)));
+    }
+    return operands;
+}
+
+const IrValue* RowScanStepInput(const IrValue* step, const WaveReduction& reduction, std::uint32_t control) {
+    if (!Is(step, IrOpcode::DppUpdateU32) || !RowShiftFlags(step, control) || !AllLanesBit(step->Argument(2))) return nullptr;
+    const auto* previous = Resolved(step->Argument(1));
+    const auto operands = ReductionOperands(Resolved(step->Argument(0)), reduction);
+    const bool matched = operands && EitherOrder(*operands, [&](const IrValue* moved, const IrValue* own) {
+        return own == previous && Is(moved, IrOpcode::DppMoveU32) && RowShiftFlags(moved, control) && Resolved(moved->Argument(0)) == previous && AllLanesBit(moved->Argument(1));
+    });
+    return matched ? previous : nullptr;
+}
+
+const IrValue* Unmasked(const IrValue* value) {
+    while (Is(value, IrOpcode::SelectU32) && AllLanesBit(value->Argument(0))) value = Resolved(value->Argument(1));
+    return value;
+}
+
+bool CrossesRowsOf(const IrValue* value, const IrValue* scan) {
+    const auto* permlane = Unmasked(value);
+    if (!Is(permlane, IrOpcode::Permlane16U32)) return false;
+    const auto flags = permlane->Flags<PermlaneFlags>();
+    return flags.x16 && !flags.fetchInactive && Resolved(permlane->Argument(0)) == scan && IsU32(permlane->Argument(1), 0xffffffffu) && IsU32(permlane->Argument(2), 0xffffffffu) && AllLanesBit(permlane->Argument(3));
+}
+
+std::optional<HalfWaveScan> MatchHalfWaveScan(const IrValue* value, IrShaderStage stage) {
+    const auto* combined = Unmasked(Resolved(value));
+    std::optional<std::array<const IrValue*, 2>> operands;
+    const auto reduction = std::find_if(WaveReductions.begin(), WaveReductions.end(), [&](const WaveReduction& candidate) { return (operands = ReductionOperands(combined, candidate)).has_value(); });
+    const IrValue* scan = nullptr;
+    if (reduction == WaveReductions.end() || !EitherOrder(*operands, [&](const IrValue* own, const IrValue* crossed) { scan = own; return CrossesRowsOf(crossed, own); })) return std::nullopt;
+    for (const auto control : {0x118u, 0x114u, 0x112u, 0x111u}) {
+        scan = RowScanStepInput(scan, *reduction, control);
+        if (scan == nullptr) return std::nullopt;
+    }
+    const auto* source = Unmasked(scan);
+    if (!Is(source, IrOpcode::SelectU32) || !IsU32(source->Argument(2), reduction->identity) || !EntryLaneWalk{stage}.ZeroBit(source->Argument(0))) return std::nullopt;
+    return HalfWaveScan{&*reduction, source};
+}
+
+std::optional<std::uint32_t> EmitHalfWaveReduction(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t lane) {
+    auto& state = ctx.state;
+    if (state.program.WaveSize() != 64u || (lane & 31u) != 31u) return std::nullopt;
+    const auto scan = MatchHalfWaveScan(inst.Argument(0), state.program.Resources().stage);
+    if (!scan) return std::nullopt;
+    if (scan->reduction->floating) {
+        if (lane < 32u || state.hostSubgroupSize > 32u) return std::nullopt;
+        return ConstantU32(state, scan->reduction->identity);
+    }
+    const auto read = "v_readlane_b32 of lane " + std::to_string(lane) + " of a wave64 half-wave reduction scan";
+    const auto& capabilities = state.supportedCapabilities;
+    if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformArithmetic)) == capabilities.end()) ctx.Fail(inst, (read + " needs subgroup arithmetic, which the device lacks").c_str());
+    if (state.hostSubgroupSize > 64u) ctx.Fail(inst, (read + " on a " + std::to_string(state.hostSubgroupSize) + "-lane host subgroup, which is wider than the wave").c_str());
+    const auto identity = ConstantU32(state, scan->reduction->identity);
+    if (lane >= 32u && state.hostSubgroupSize <= 32u) return identity;
+    auto keys = ctx.Def(scan->source);
+    if (state.hostSubgroupSize > 32u) {
+        const auto upper = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), ConstantU32(state, 32u));
+        keys = lane >= 32u ? Select(state, TypeU32(state), upper, keys, identity) : Select(state, TypeU32(state), upper, identity, keys);
+    }
+    state.module.EmitCapability(spv::CapabilityGroupNonUniformArithmetic);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(scan->reduction->reduce, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), static_cast<std::uint32_t>(spv::GroupOperationReduce), keys);
+    return result;
+}
+
 }
 
 std::uint32_t EmitConvertU16U32(SpirvEmitterState& state, std::uint32_t arg0) {
@@ -243,11 +463,12 @@ std::uint32_t EmitConvertF16F32(SpirvEmitterState& state, std::uint32_t arg0) {
 }
 
 std::uint32_t EmitConvertS32F32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitF32ToU32(state, arg0, true);
+    const auto converted = Unary(state, spv::OpConvertFToS, TypeI32(state), arg0);
+    return Unary(state, spv::OpBitcast, TypeU32(state), converted);
 }
 
 std::uint32_t EmitConvertU32F32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitF32ToU32(state, arg0, false);
+    return Unary(state, spv::OpConvertFToU, TypeU32(state), arg0);
 }
 
 std::uint32_t EmitConvertF32S32(SpirvEmitterState& state, std::uint32_t arg0) {
@@ -259,9 +480,23 @@ std::uint32_t EmitCompositeExtractU64(SpirvEmitterState& state, std::uint32_t ar
     return EmitNative<spv::OpCompositeExtract, IrType::U32>(state, arg0, arg1->ImmediateU32());
 }
 
+static bool NativeF16Rte(const SpirvEmitterState& state);
+
+static std::uint32_t EmitF32ToF16BitsTowardZero(SpirvEmitterState& state, std::uint32_t value) {
+    if (!NativeF16Rte(state)) return EmitF32ToF16RtzBits(state, value);
+    const auto u32 = TypeU32(state);
+    const auto f16 = state.module.Type(spv::OpTypeFloat, 16u);
+    const auto nearest = EmitF32ToF16BitsRte(state, value);
+    const auto half = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, f16, half, Unary(state, spv::OpBitcast, state.module.Type(spv::OpTypeVector, f16, 2u), nearest), 0u);
+    const auto widened = Unary(state, spv::OpFConvert, TypeF32(state), half);
+    const auto away = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), EmitFAbsValue(state, widened), EmitFAbsValue(state, value));
+    return Select(state, u32, away, Binary(state, spv::OpISub, u32, nearest, ConstantU32(state, 1u)), nearest);
+}
+
 std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    const auto low = EmitF32ToF16RtzBits(state, arg0);
-    const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16u));
+    const auto low = EmitF32ToF16BitsTowardZero(state, arg0);
+    const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), EmitF32ToF16BitsTowardZero(state, arg1), ConstantU32(state, 16u));
     return Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
 }
 
@@ -443,14 +678,29 @@ std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, std::uint32_t arg0, std::
 }
 
 std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
-    const auto minAb = EmitMinMaxF32Value(state, arg0, arg1, false);
-    const auto min3 = EmitMinMaxF32Value(state, minAb, arg2, false);
-    const auto maxAb = EmitMinMaxF32Value(state, arg0, arg1, true);
-    const auto highMin = EmitMinMaxF32Value(state, maxAb, arg2, false);
-    const auto median = EmitMinMaxF32Value(state, minAb, highMin, true);
-    const auto nanAb = Binary(state, spv::OpLogicalOr, TypeBool(state), EmitClassifyF32(state, arg0).nan, EmitClassifyF32(state, arg1).nan);
-    const auto anyNan = Binary(state, spv::OpLogicalOr, TypeBool(state), nanAb, EmitClassifyF32(state, arg2).nan);
-    return Select(state, TypeF32(state), anyNan, min3, median);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
+    const auto value = [&](std::uint32_t valueBits) { return Unary(state, spv::OpBitcast, TypeF32(state), valueBits); };
+    const auto isNan = [&](std::uint32_t valueBits) { return EmitCompareU32Constant(state, spv::OpUGreaterThan, EmitAndConstant(state, valueBits, 0x7fffffffu), 0x7f800000u); };
+    const auto numeric = [&](std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+        const auto either = Binary(state, spv::OpBitwiseOr, u32, lhs, rhs);
+        const auto bothZero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, either, 0x7fffffffu), 0u);
+        const auto zeroBits = maxValue ? Binary(state, spv::OpBitwiseAnd, u32, lhs, rhs) : either;
+        const auto ordered = Select(state, u32, Binary(state, maxValue ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan, boolean, value(lhs), value(rhs)), lhs, rhs);
+        return Select(state, u32, bothZero, zeroBits, ordered);
+    };
+    const auto a = bits(arg0);
+    const auto b = bits(arg1);
+    const auto c = bits(arg2);
+    const auto nanA = isNan(a);
+    const auto nanB = isNan(b);
+    const auto nanC = isNan(c);
+    const auto minAb = Select(state, u32, nanB, a, numeric(a, b, false));
+    const auto min3 = Select(state, u32, nanC, minAb, numeric(minAb, c, false));
+    const auto median = numeric(minAb, numeric(numeric(a, b, true), c, false), true);
+    const auto anyNan = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpLogicalOr, boolean, nanA, nanB), nanC);
+    return value(Select(state, u32, anyNan, min3, median));
 }
 
 std::uint32_t EmitFPRecip32(SpirvEmitterState& state, std::uint32_t arg0) {
@@ -474,20 +724,53 @@ std::uint32_t EmitFPExp2(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {EmitFlushF32DenormToSignedZero(state, arg0)});
 }
 
+std::uint32_t Log2SeriesNearOne(SpirvEmitterState& state, std::uint32_t difference) {
+    auto polynomial = ConstantF32(state, 0xbe000000u);
+    for (const std::uint32_t coefficient : {0x3e124925u, 0xbe2aaaabu, 0x3e4ccccdu, 0xbe800000u, 0x3eaaaaabu, 0xbf000000u, 0x3f800000u}) {
+        polynomial = Exact(state, EmitExt(state, TypeF32(state), GLSLstd450Fma, {polynomial, difference, ConstantF32(state, coefficient)}));
+    }
+    const auto product = Exact(state, Binary(state, spv::OpFMul, TypeF32(state), difference, polynomial));
+    return Exact(state, Binary(state, spv::OpFMul, TypeF32(state), product, ConstantF32(state, 0x3fb8aa3bu)));
+}
+
 std::uint32_t EmitFPLog2(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitExt(state, TypeF32(state), GLSLstd450Log2, {EmitFlushF32DenormToSignedZero(state, arg0)});
+    const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Log2, {source});
+    const auto difference = Exact(state, Binary(state, spv::OpFSub, TypeF32(state), source, ConstantF32(state, 0x3f800000u)));
+    const auto series = Log2SeriesNearOne(state, difference);
+    const auto valueBits = Unary(state, spv::OpBitcast, TypeU32(state), value);
+    const auto seriesBits = Unary(state, spv::OpBitcast, TypeU32(state), series);
+    const auto distance = EmitExt(state, TypeU32(state), GLSLstd450UMin, {Binary(state, spv::OpISub, TypeU32(state), valueBits, seriesBits), Binary(state, spv::OpISub, TypeU32(state), seriesBits, valueBits)});
+    const auto near = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), EmitExt(state, TypeF32(state), GLSLstd450FAbs, {difference}), ConstantF32(state, 0x3e000000u));
+    const auto far = Binary(state, spv::OpUGreaterThan, TypeBool(state), distance, ConstantU32(state, 4u));
+    return Select(state, TypeF32(state), Binary(state, spv::OpLogicalAnd, TypeBool(state), near, far), series, value);
+}
+
+std::uint32_t TrigLinearNearZero(SpirvEmitterState& state, std::uint32_t value, std::uint32_t distance, std::uint32_t linearConstant) {
+    const auto linear = Binary(state, spv::OpFMul, TypeF32(state), distance, linearConstant);
+    const auto magnitude = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), distance), ConstantU32(state, 0x7fffffffu));
+    const auto near = Binary(state, spv::OpULessThan, TypeBool(state), magnitude, ConstantU32(state, 0x39800000u));
+    return Select(state, TypeF32(state), near, linear, value);
 }
 
 std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, true);
-    const auto source = Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu));
-    return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
+    const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
+    const auto signBits = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), cycle), ConstantU32(state, 0x80000000u));
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Sin, {Binary(state, spv::OpFMul, TypeF32(state), absolute, ConstantF32(state, 0x40c90fdbu))});
+    const auto nearHalf = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), absolute, ConstantF32(state, 0x3e800000u));
+    const auto distance = Select(state, TypeF32(state), nearHalf, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3f000000u), absolute), absolute);
+    const auto linearConstant = Select(state, TypeF32(state), nearHalf, ConstantF32(state, 0x40c90fdbu), ConstantF32(state, 0x40c90fd5u));
+    const auto result = TrigLinearNearZero(state, value, distance, linearConstant);
+    return Unary(state, spv::OpBitcast, TypeF32(state), Binary(state, spv::OpBitwiseOr, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), result), signBits));
 }
 
 std::uint32_t EmitFPCos(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, false);
-    const auto source = Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu));
-    return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
+    const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Cos, {Binary(state, spv::OpFMul, TypeF32(state), absolute, ConstantF32(state, 0x40c90fdbu))});
+    const auto distance = Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u), absolute);
+    return TrigLinearNearZero(state, value, distance, ConstantF32(state, 0x40c90fdbu));
 }
 
 std::uint32_t EmitIdentity(SpirvValueEmitContext&, std::uint32_t value) {
@@ -558,9 +841,10 @@ std::uint32_t EmitReadFirstLane(SpirvValueEmitContext& ctx, const IrValue& inst)
 std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const IrValue* selector = inst.Argument(1)->Resolve();
-    if (selector != nullptr && selector->HasImmediate() && HostSubgroupNarrowerThanWave(state)) {
+    if (selector != nullptr && selector->HasImmediate() && state.program.Resources().stage != IrShaderStage::Compute && state.laneCount == 1u) {
         const auto index = selector->ImmediateU32() & (state.program.WaveSize() - 1u);
-        if (index >= state.hostSubgroupSize) FailOutsideHostSubgroup(ctx, inst, "v_readlane_b32 of lane " + std::to_string(index));
+        if (const auto reduced = EmitHalfWaveReduction(ctx, inst, index)) return *reduced;
+        if (HostSubgroupNarrowerThanWave(state) && index >= state.hostSubgroupSize) FailOutsideHostSubgroup(ctx, inst, "v_readlane_b32 of lane " + std::to_string(index));
     }
     const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, state.program.WaveSize() - 1u));
     return ctx.Shuffle(inst, 0, lane);
@@ -827,7 +1111,12 @@ std::uint32_t EmitFPUnordEqual32(SpirvEmitterState& state, std::uint32_t arg0, s
 }
 
 std::uint32_t EmitFPOrdNotEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFOrdNotEqual, IrType::U1>(state, arg0, arg1);
+    const auto ordered = [&](std::uint32_t value) {
+        const auto magnitude = EmitNative<spv::OpBitwiseAnd, IrType::U32>(state, EmitNative<spv::OpBitcast, IrType::U32>(state, value), ConstantU32(state, 0x7fffffffu));
+        return EmitNative<spv::OpULessThanEqual, IrType::U1>(state, magnitude, ConstantU32(state, 0x7f800000u));
+    };
+    const auto bothOrdered = EmitNative<spv::OpLogicalAnd, IrType::U1>(state, ordered(arg0), ordered(arg1));
+    return EmitNative<spv::OpLogicalAnd, IrType::U1>(state, EmitNative<spv::OpFUnordNotEqual, IrType::U1>(state, arg0, arg1), bothOrdered);
 }
 
 std::uint32_t EmitFPUnordNotEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -839,7 +1128,7 @@ std::uint32_t EmitFPOrdLessThan32(SpirvEmitterState& state, std::uint32_t arg0, 
 }
 
 std::uint32_t EmitFPUnordLessThan32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFUnordLessThan, IrType::U1>(state, arg0, arg1);
+    return EmitNative<spv::OpLogicalNot, IrType::U1>(state, EmitNative<spv::OpFOrdGreaterThanEqual, IrType::U1>(state, arg0, arg1));
 }
 
 std::uint32_t EmitFPOrdGreaterThan32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -847,7 +1136,7 @@ std::uint32_t EmitFPOrdGreaterThan32(SpirvEmitterState& state, std::uint32_t arg
 }
 
 std::uint32_t EmitFPUnordGreaterThan32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFUnordGreaterThan, IrType::U1>(state, arg0, arg1);
+    return EmitNative<spv::OpLogicalNot, IrType::U1>(state, EmitNative<spv::OpFOrdLessThanEqual, IrType::U1>(state, arg0, arg1));
 }
 
 std::uint32_t EmitFPOrdLessThanEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -855,7 +1144,7 @@ std::uint32_t EmitFPOrdLessThanEqual32(SpirvEmitterState& state, std::uint32_t a
 }
 
 std::uint32_t EmitFPUnordLessThanEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFUnordLessThanEqual, IrType::U1>(state, arg0, arg1);
+    return EmitNative<spv::OpLogicalNot, IrType::U1>(state, EmitNative<spv::OpFOrdGreaterThan, IrType::U1>(state, arg0, arg1));
 }
 
 std::uint32_t EmitFPOrdGreaterThanEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -863,7 +1152,7 @@ std::uint32_t EmitFPOrdGreaterThanEqual32(SpirvEmitterState& state, std::uint32_
 }
 
 std::uint32_t EmitFPUnordGreaterThanEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFUnordGreaterThanEqual, IrType::U1>(state, arg0, arg1);
+    return EmitNative<spv::OpLogicalNot, IrType::U1>(state, EmitNative<spv::OpFOrdLessThan, IrType::U1>(state, arg0, arg1));
 }
 
 std::uint32_t EmitFPAdd32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -918,10 +1207,6 @@ std::uint32_t EmitLogicalNotBool(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitNative<spv::OpLogicalNot, IrType::U1>(state, arg0);
 }
 
-std::uint32_t EmitTruncF32Value(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitGlsl<GLSLstd450Trunc, IrType::F32>(state, arg0);
-}
-
 std::uint32_t EmitFNegateValue(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitNative<spv::OpFNegate, IrType::F32>(state, arg0);
 }
@@ -930,7 +1215,40 @@ std::uint32_t EmitFAbsValue(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitGlsl<GLSLstd450FAbs, IrType::F32>(state, arg0);
 }
 
+static bool NativeF16Rte(const SpirvEmitterState& state) {
+    const auto supported = [&](spv::Capability capability) {
+        return std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(capability)) != state.supportedCapabilities.end();
+    };
+    return supported(spv::CapabilityFloat16) && supported(spv::CapabilityRoundingModeRTE) && supported(spv::CapabilityDenormPreserve);
+}
+
+static std::uint32_t EmitNativeF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
+    state.module.EmitCapability(spv::CapabilityFloat16);
+    state.module.EmitCapability(spv::CapabilityRoundingModeRTE);
+    state.module.EmitCapability(spv::CapabilityDenormPreserve);
+    if (!state.nativeF16ModesEmitted) {
+        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeRoundingModeRTE, 16u);
+        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 16u);
+        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
+        state.nativeF16ModesEmitted = true;
+    }
+    const auto u32 = TypeU32(state);
+    const auto f16 = state.module.Type(spv::OpTypeFloat, 16u);
+    const auto half = Unary(state, spv::OpFConvert, f16, value);
+    const auto pair = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, state.module.Type(spv::OpTypeVector, f16, 2u), pair, half, state.module.Constant(spv::OpConstant, f16, 0u));
+    const auto bits = Unary(state, spv::OpBitcast, u32, pair);
+    const auto source = Unary(state, spv::OpBitcast, u32, value);
+    const auto magnitude = Binary(state, spv::OpBitwiseAnd, u32, source, ConstantU32(state, 0x7fffffffu));
+    const auto sign = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, source, ConstantU32(state, 16u)), ConstantU32(state, 0x8000u));
+    const auto payload = Binary(state, spv::OpShiftRightLogical, u32, Binary(state, spv::OpBitwiseAnd, u32, magnitude, ConstantU32(state, 0x7fffffu)), ConstantU32(state, 13u));
+    const auto nan = Binary(state, spv::OpBitwiseOr, u32, ConstantU32(state, 0x7e00u), payload);
+    const auto result = Select(state, u32, Binary(state, spv::OpUGreaterThan, TypeBool(state), magnitude, ConstantU32(state, 0x7f800000u)), nan, Binary(state, spv::OpBitwiseAnd, u32, bits, ConstantU32(state, 0x7fffu)));
+    return Binary(state, spv::OpBitwiseOr, u32, sign, result);
+}
+
 std::uint32_t EmitF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
+    if (NativeF16Rte(state)) return EmitNativeF32ToF16BitsRte(state, value);
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto constant = [&](std::uint32_t bits) { return ConstantU32(state, bits); };

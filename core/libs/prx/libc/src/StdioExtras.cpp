@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -18,10 +19,19 @@ namespace {
 
 using GuestNewHandler = void (APS5_VABI*)();
 
-GuestNewHandler g_newHandler = nullptr;
+std::atomic<GuestNewHandler> g_newHandler{nullptr};
 
 void* Allocate(std::size_t size) {
-    return ApplicationHeapAllocate_nid_no_patch(size == 0 ? 1 : size);
+    for (;;) {
+        GuestNewHandler handler = nullptr;
+        try {
+            return ApplicationHeapAllocate_nid_no_patch(size == 0 ? 1 : size);
+        } catch (const std::bad_alloc&) {
+            handler = g_newHandler.load();
+            if (handler == nullptr) throw;
+        }
+        handler();
+    }
 }
 
 }
@@ -58,13 +68,11 @@ const char* APS5_VABI setlocale_nid_postfix(int category, const char* locale) {
 }
 
 GuestNewHandler APS5_VABI _ZSt15set_new_handlerPFvvE_nid_postfix(GuestNewHandler handler) {
-    const auto previous = g_newHandler;
-    g_newHandler = handler;
-    return previous;
+    return g_newHandler.exchange(handler);
 }
 
 GuestNewHandler APS5_VABI _ZSt15get_new_handlerv_nid_postfix() {
-    return g_newHandler;
+    return g_newHandler.load();
 }
 
 unsigned char _ZSt7nothrow_nid_postfix = 0;
@@ -110,6 +118,11 @@ void APS5_VABI _ZdaPvm_nid_postfix(void* pointer, std::size_t) {
 }
 
 void APS5_VABI _ZdlPvSt11align_val_t_nid_postfix(void* pointer, std::size_t alignment) {
+    (void)alignment;
+    if (pointer != nullptr) ApplicationHeapFree_nid_no_patch(pointer);
+}
+
+void APS5_VABI _ZdlPvmSt11align_val_t_nid_postfix(void* pointer, std::size_t, std::size_t alignment) {
     (void)alignment;
     if (pointer != nullptr) ApplicationHeapFree_nid_no_patch(pointer);
 }

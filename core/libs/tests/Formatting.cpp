@@ -1,4 +1,5 @@
 #include "SceTypes.hpp"
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <cstdio>
@@ -8,7 +9,10 @@ int APS5_VABI snprintf_nid_postfix(char*, size_t, const char*, ...);
 int APS5_VABI sprintf_nid_postfix(char*, const char*, ...);
 int APS5_VABI printf_nid_postfix(const char*, ...);
 int APS5_VABI libc_printf_nid_postfix(const char*, ...);
+int APS5_VABI sscanf_nid_postfix(const char*, const char*, ...);
 int APS5_VABI vsnprintf_nid_postfix(char*, size_t, const char*, VaList*);
+int APS5_VABI vsnprintf_s_nid_postfix(char*, size_t, const char*, VaList*);
+int APS5_VABI vsscanf_s_nid_postfix(const char*, const char*, VaList*);
 int APS5_VABI vprintf_nid_postfix(const char*, VaList*);
 }
 
@@ -24,6 +28,26 @@ static int APS5_VABI FormatList(char* buffer, size_t size, const char* format, .
     const VaList original = list;
     const int result = vsnprintf_nid_postfix(buffer, size, format, &list);
     Require(std::memcmp(&list, &original, sizeof(list)) == 0);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+static int APS5_VABI FormatListS(char* buffer, size_t size, const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    VaList list;
+    std::memcpy(&list, args, sizeof(list));
+    const int result = vsnprintf_s_nid_postfix(buffer, size, format, &list);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+static int APS5_VABI ScanListS(const char* buffer, const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    VaList list;
+    std::memcpy(&list, args, sizeof(list));
+    const int result = vsscanf_s_nid_postfix(buffer, format, &list);
     __builtin_sysv_va_end(args);
     return result;
 }
@@ -63,6 +87,21 @@ static bool CheckWidePrecision() {
     Require(snprintf_nid_postfix(output, sizeof(output), "%.2ls", bounded) == 2 && std::strcmp(output, "AB") == 0);
     Require(snprintf_nid_postfix(nullptr, 0, "%.1ls", u"\u00e9") == 0);
     Require(snprintf_nid_postfix(output, sizeof(output), "%.1s", "\xc3\xa9") == 1 && static_cast<unsigned char>(output[0]) == 0xc3 && output[1] == 0);
+    Require(FormatList(output, sizeof(output), "%S:%lc:%C:%d", u"\u00e9", 0x20ac, 0x41, 7) == 10 && std::strcmp(output, "\xc3\xa9:\xe2\x82\xac:A:7") == 0);
+    Require(snprintf_nid_postfix(output, sizeof(output), "%.*S", 3, u"\u00e9\u20ac") == 2 && std::strcmp(output, "\xc3\xa9") == 0);
+    Require(snprintf_nid_postfix(output, sizeof(output), "[%ls]", static_cast<const char16_t*>(nullptr)) == 8 && std::strcmp(output, "[(null)]") == 0);
+    Require(snprintf_nid_postfix(output, sizeof(output), "a%lcb%C", 0, 0) == 4 && std::memcmp(output, "a\0b\0", 5) == 0);
+#ifndef _WIN32
+    Require(FormatList(output, sizeof(output), "%%ls:%2$d:%1$d", 3, 7) == 7 && std::strcmp(output, "%ls:7:3") == 0);
+#endif
+    for (std::size_t capacity = 0; capacity <= 6; ++capacity) {
+        std::memset(output, '!', sizeof(output));
+        int count = -1;
+        Require(FormatList(capacity ? output : nullptr, capacity, "%ls%n", u"A\u00e9Z", &count) == 4 && count == 4);
+        const auto copied = capacity == 0 ? 0 : std::min<std::size_t>(capacity - 1, 4);
+        Require(std::memcmp(output, "A\xc3\xa9Z", copied) == 0 && output[capacity] == '!');
+        if (capacity) Require(output[copied] == 0);
+    }
     return correct;
 }
 
@@ -101,6 +140,15 @@ __attribute__((noinline)) static void APS5_VABI RunChecks() {
     Require(snprintf_nid_postfix(buffer, 1, "%d", 123) == 3 && buffer[0] == 0);
     Require(sprintf_nid_postfix(buffer, "%hhd %hhu %hd %hu %%", 255, 257, 65535, 65537) == 11);
     Require(std::strcmp(buffer, "-1 1 -1 1 %") == 0);
+    Require(sprintf_nid_postfix(buffer, "%d %d %d %d %d %d", 1, 2, 3, 4, 5, 6) == 11);
+    Require(std::strcmp(buffer, "1 2 3 4 5 6") == 0);
+    int first = 0, second = 0, third = 0, fourth = 0, fifth = 0, sixth = 0;
+    char word[16] = {};
+    double real = 0.0;
+    Require(sscanf_nid_postfix("1 2 3 4 5 6 seven 8.5", "%d %d %d %d %d %d %15s %lf",
+        &first, &second, &third, &fourth, &fifth, &sixth, word, &real) == 8);
+    Require(first == 1 && second == 2 && third == 3 && fourth == 4 && fifth == 5 && sixth == 6);
+    Require(std::strcmp(word, "seven") == 0 && real == 8.5);
     long long count = -1;
     int smallCount = -1;
     Require(snprintf_nid_postfix(buffer, 3, "abcd%lnEF%n", &count, &smallCount) == 6);
@@ -109,7 +157,14 @@ __attribute__((noinline)) static void APS5_VABI RunChecks() {
     Require(buffer[0] == 'a' && buffer[1] == 0 && buffer[2] == 'b' && buffer[3] == 0);
     Require(printf_nid_postfix("printf: %d %.1f\n", 7, 2.5) == 14);
     Require(libc_printf_nid_postfix("libc_printf: %s\n", "OK") == 16);
+    Require(libc_printf_nid_postfix("%d %d %d %d %d %d %d\n", 1, 22, 333, 4444, 55555, 666666, 7777777) == 35);
     Require(PrintList("vprintf: %d\n", 42) == 12);
+    Require(FormatListS(buffer, sizeof(buffer), "%d-%s", 42, "x") == 4 && std::strcmp(buffer, "42-x") == 0);
+    int scanNum = 0;
+    char scanWord[8] = {};
+    Require(ScanListS("123 test", "%d %s", &scanNum, scanWord, 8u) == 2 && scanNum == 123 && std::strcmp(scanWord, "test") == 0);
+    char tooSmall[4] = {'x', 'x', 'x', 'x'};
+    Require(ScanListS("abcdef", "%s", tooSmall, 4u) == 0 && tooSmall[0] == '\0');
     std::puts("Formatting checks passed: 10000 iterations");
 }
 

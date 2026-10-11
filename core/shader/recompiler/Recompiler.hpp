@@ -1,6 +1,8 @@
 #ifndef CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
+#include "RuntimeAbi.hpp"
+#include "PipelineSpecialization.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -8,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <string_view>
 #include <vector>
 
@@ -44,6 +47,7 @@ struct ShaderComputeStageInfo {
     bool tgSizeEnable;
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
+    std::uint32_t scratchDwords = 0;
 
     [[nodiscard]] bool PartialGroups() const {
         return partialThreads != std::array<std::uint32_t, 3>{};
@@ -104,6 +108,11 @@ enum class ConservativeZExport : std::uint8_t {
     GreaterThanZ
 };
 
+enum class ColorExportPacking : std::uint8_t {
+    None,
+    Unorm10_11_11
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -126,8 +135,12 @@ struct ShaderPixelStageInfo {
     bool earlyZ;
     bool executeOnNoop;
     ConservativeZExport conservativeZExport;
+    bool orderedPixelShader;
     std::array<std::uint8_t, 8> targetOutputMode;
     std::array<std::uint8_t, 8> targetExportMapping;
+    std::array<ColorExportPacking, 8> targetExportPacking;
+    bool dualSourceBlend;
+    bool alphaToCoverage;
 };
 
 struct ShaderVertexBufferResource {
@@ -151,6 +164,19 @@ struct ShaderVertexStageInfo {
     bool fetchEmbedded;
 };
 
+struct ShaderFloatMode {
+    std::uint32_t floatMode = 0;
+    bool dx10Clamp = false;
+    bool ieeeMode = false;
+    bool fp16Overflow = false;
+
+    bool operator==(const ShaderFloatMode&) const = default;
+};
+
+inline constexpr std::uint32_t InterpolationQuiet = 1u;
+inline constexpr std::uint32_t InterpolationFlush32 = 2u;
+inline constexpr std::uint32_t InterpolationFlush16 = 4u;
+
 struct GuestContext {
     std::uint32_t waveSize;
     std::uint32_t userDataBaseRegister;
@@ -159,6 +185,7 @@ struct GuestContext {
     std::optional<ShaderPixelStageInfo> pixel;
     std::optional<ShaderVertexStageInfo> vertex;
     std::span<const MemoryRegion> memory;
+    std::optional<ShaderFloatMode> floatMode;
 };
 
 struct MeshTargetLimits {
@@ -198,6 +225,9 @@ struct SpirvTarget {
     std::optional<TessellationTargetLimits> tessellation;
     bool nonConstantImageOffsets = false;
     std::uint32_t srgbDecodeFormats = 0;
+    bool narrowSubgroupClock = false;
+    bool fixedPushSlots = false;
+    bool float64DenormPreserve = false;
 };
 
 struct BindingLayout {
@@ -250,7 +280,11 @@ inline constexpr std::uint32_t MeshArgumentAddressDword = 4;
 inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
 inline constexpr std::uint32_t MeshArgumentBytes = 20;
+inline constexpr std::uint32_t MeshIndexRestartTable = 0x100;
+inline constexpr std::uint32_t MeshRestartLengthDword = MeshArgumentBytes / 4;
+inline constexpr std::uint32_t MeshRestartTableDword = MeshRestartLengthDword + 1;
 inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;
+inline constexpr std::uint32_t WorkgroupMemoryDescriptorSet = 1;
 
 struct GraphicsDrawParameters {
     std::uint64_t indexAddress;
@@ -332,8 +366,10 @@ struct DescriptorBinding {
     // (a producer that does not fill it) must be treated as written.
     std::vector<bool> bufferWritten;
     std::vector<bool> samplerUnnormalized;
+    std::vector<bool> samplerIntegerBorder;
     std::vector<bool> imageUnnormalized;
     std::vector<std::uint32_t> imageSamplers;
+    std::vector<bool> bufferRead;
 };
 
 struct VertexAttribute {
@@ -341,6 +377,7 @@ struct VertexAttribute {
     std::uint32_t components;
     ShaderVertexBufferResource resource;
     std::uint32_t fetchIndex;
+    std::uint32_t formatComponents = 0;
 };
 
 struct FragmentParameter {
@@ -350,6 +387,21 @@ struct FragmentParameter {
     bool perVertex;
     bool custom = false;
 };
+
+struct BarycentricEmulation {
+    bool active = false;
+    bool smooth = false;
+    bool linear = false;
+};
+
+struct BarycentricEmulationLayout {
+    static constexpr std::uint32_t NoLocation = 0xffffffffu;
+    std::uint32_t smoothLocation = NoLocation;
+    std::uint32_t linearLocation = NoLocation;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> perVertexLocations;
+};
+
+[[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation);
 
 // Compiled SPIR-V shared between a cached variant and every result materialized from it: results
 // are copied per dispatch and draw, so the words are reference counted and only duplicated when a
@@ -396,17 +448,36 @@ private:
     std::shared_ptr<std::vector<std::uint32_t>> words;
 };
 
-struct RecompileResult {
+struct VertexInput {
+    std::uint32_t location;
+    std::uint32_t components;
+    std::uint32_t fetchIndex;
+    std::uint32_t outputMask = 0;
+
+    bool operator==(const VertexInput& other) const = default;
+};
+
+struct VertexInputPatch {
+    std::uint32_t location;
+    std::uint32_t word;
+    std::array<std::uint32_t, 3> values;
+
+    bool operator==(const VertexInputPatch& other) const = default;
+};
+
+struct CompiledShaderArtifact {
+    std::vector<VertexInputPatch> vertexInputPatches;
     SharedSpirv spirv;
-    std::vector<DescriptorBinding> bindings;
-    std::vector<std::byte> pushConstants;
     std::uint32_t memoryOffsetDword = 0;
+    std::uint32_t shaderDataDwords = 0;
+    std::uint32_t imageMetadataDword = 0;
+    std::uint32_t runtimeImageCount = 0;
+    std::vector<std::uint32_t> runtimeImageResources;
     std::uint32_t bdaAbiVersion = 0;
-    std::vector<VertexAttribute> vertexAttributes;
+    std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
+    std::vector<VertexInput> vertexInputs;
     std::int32_t vertexOffsetSgpr = -1;
     std::int32_t instanceOffsetSgpr = -1;
-    // The offset SGPR is also read elsewhere in the program (so a value folded into the draw's
-    // first vertex / instance cannot stand in for it), or two SGPRs were added (the SGPR is -1).
     bool vertexOffsetShared = false;
     bool instanceOffsetShared = false;
     bool vertexOffsetConflict = false;
@@ -414,20 +485,27 @@ struct RecompileResult {
     std::uint32_t hostSubgroupSize = 0;
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
-    bool cacheHit = false;
-    // Identifies the compiled variant the result came from: equal ids mean identical SPIR-V and
-    // bindings, so drivers can reuse pipeline objects. Zero when unknown.
+    BarycentricEmulation barycentricEmulation;
     std::uint64_t variantId = 0;
+};
+
+struct ShaderInvocation {
+    std::vector<PipelineSpecializationConstant> specialization;
+    std::uint64_t specializationId = 0;
+    std::vector<DescriptorBinding> bindings;
+    std::vector<std::byte> pushConstants;
+    std::vector<VertexAttribute> vertexAttributes;
+    std::uint32_t poisonedSrtReads = 0;
+};
+
+struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
+    bool cacheHit = false;
+    std::uint32_t workgroupMemoryDwords = 0;
+    [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
 };
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);
 
-// The resource plan, snapshot and specialization a driver captured for the request (see
-// CaptureResources in Optimization/ResourceProgram.hpp): this overload reuses them instead of
-// materializing the request's memory regions again, and is otherwise Recompile(request). The
-// result is immutable and shared: a capture that reproduces a snapshot the source's variant was
-// materialized over before receives the same object (`memoHit`), so the descriptor population runs
-// once per distinct snapshot. APS5_NO_RESULT_MEMO=1 materializes every call.
 struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
 
@@ -445,6 +523,16 @@ struct RectListShaders {
 };
 
 [[nodiscard]] RectListShaders BuildRectListShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target);
+
+struct GeometryStageLimits {
+    std::uint32_t maxGeometryInputComponents;
+    std::uint32_t maxGeometryOutputComponents;
+    std::uint32_t maxGeometryOutputVertices;
+    std::uint32_t maxGeometryTotalOutputComponents;
+    std::uint32_t maxFragmentInputComponents;
+};
+
+[[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
 }
 

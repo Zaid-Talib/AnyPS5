@@ -17,9 +17,12 @@
 #include <linux/udmabuf.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+#include <array>
 #include <atomic>
+#include <tuple>
 #include <functional>
 #include <bit>
 #include <condition_variable>
@@ -29,6 +32,7 @@
 #include <set>
 #include <thread>
 #include <stop_token>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
@@ -36,6 +40,8 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace AgcDriver::Graphics {
 
@@ -52,6 +58,9 @@ struct ImageMirror {
     std::uint64_t bytes = 0;
     bool writable = false;
     bool heap = false;
+    bool sparse = false;
+    std::uint64_t reserved = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
     std::vector<std::uint64_t> generations;
     std::weak_ptr<const GuestAllocations::Range> range;
     std::shared_ptr<Buffer> buffer;
@@ -83,9 +92,23 @@ struct GuestBufferMemory::AddressSpace {
     std::uint64_t serial = 0;
     GuestAllocations::Lease lease;
     std::vector<Region> base;
+    struct HeapRun {
+        std::uint64_t begin;
+        std::uint64_t bytes;
+        std::size_t first;
+        std::size_t last;
+    };
+    bool mirrored = false;
+    std::vector<std::size_t> writableMirrors;
+    std::vector<ImageMirror*> heapMirrors;
+    std::vector<HeapRun> heapRuns;
+    std::vector<ImageMirror*> sparseMirrors;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> verified;
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    mutable std::mutex tableMutex;
+    mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
 };
 
 namespace {
@@ -125,7 +148,9 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
+    std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
+    std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
@@ -152,11 +177,20 @@ void destroyImport(const Context& context, const HostImport& entry) {
 // Frees a dropped import's Vulkan objects when it is released. Never copied: a copy would destroy the
 // same handles twice (and a temporary would destroy them at once).
 struct RetiredImport {
-    RetiredImport(const Context& context, const HostImport& entry) : context(context), entry(entry) {}
+    RetiredImport(VkDevice device, PFN_vkDestroyBuffer destroyBuffer, PFN_vkFreeMemory freeMemory, const HostImport& entry)
+        : device(device), destroyBuffer(destroyBuffer), freeMemory(freeMemory), entry(entry) {}
     RetiredImport(const RetiredImport&) = delete;
     RetiredImport& operator=(const RetiredImport&) = delete;
-    ~RetiredImport() { destroyImport(context, entry); }
-    Context context;
+    ~RetiredImport() {
+        destroyBuffer(device, entry.buffer, nullptr);
+        freeMemory(device, entry.memory, nullptr);
+#ifdef _WIN32
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+#endif
+    }
+    VkDevice device;
+    PFN_vkDestroyBuffer destroyBuffer;
+    PFN_vkFreeMemory freeMemory;
     HostImport entry;
 };
 
@@ -164,15 +198,17 @@ struct RetiredImport {
 // so the objects live until the batch open now completed; with no batches in flight all GPU work that
 // used it was synchronous and it is destroyed at once.
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
+bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
-void retireImport(const Context& context, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
+void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
-    RetireShadow(context, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return containingRange(lease, begin, end) != nullptr; });
-    auto holder = std::make_shared<RetiredImport>(context, it->second);
+    RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
+    auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, it->second);
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
+    state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
 }
 
@@ -190,7 +226,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
     info.size = entry.bytes;
     // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
     VkMemoryRequirements requirements{};
@@ -224,7 +260,15 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
 
 #ifndef _WIN32
 int udmabufDevice() {
-    static const int device = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    static const int device = [] {
+        const int result = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (result < 0) {
+            const int error = errno;
+            std::fprintf(stderr, "[gpu] open /dev/udmabuf: %s; shared direct memory is copied instead of imported, and GPU stores through FLAT/GLOBAL addresses do not reach it%s\n",
+                std::strerror(error), error == EACCES ? " (give the user read-write access to /dev/udmabuf, for example through the kvm group)" : "");
+        }
+        return result;
+    }();
     return device;
 }
 
@@ -256,12 +300,165 @@ const char* createDmaBufImport(const Context& context, HostImport& entry, int fi
 }
 #endif
 
+#ifndef _WIN32
+constexpr std::uint64_t ImportChunkBytes = std::uint64_t{64} << 20u;
+
+struct ImportChunk {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkFreeMemory freeMemory = nullptr;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint32_t memoryType = 0;
+    ImportChunk() = default;
+    ImportChunk(const ImportChunk&) = delete;
+    ImportChunk& operator=(const ImportChunk&) = delete;
+    ~ImportChunk() {
+        if (memory != VK_NULL_HANDLE) freeMemory(device, memory, nullptr);
+    }
+};
+
+struct ImportChunks {
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::map<std::tuple<dev_t, ino_t, std::uint64_t>, std::weak_ptr<ImportChunk>> chunks;
+};
+
+ImportChunks& Chunks() {
+    static ImportChunks chunks;
+    return chunks;
+}
+
+std::shared_ptr<ImportChunk> importChunk(const Context& context, int file, std::uint64_t index, std::uint32_t bufferTypes, const char*& step, VkResult& failure) {
+    struct stat info {};
+    if (fstat(file, &info) != 0) {
+        failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        step = "fstat of the shared backing";
+        return nullptr;
+    }
+    auto& chunks = Chunks();
+    std::lock_guard lock(chunks.mutex);
+    if (chunks.device != context.device) {
+        chunks.chunks.clear();
+        chunks.device = context.device;
+    }
+    const auto key = std::make_tuple(info.st_dev, info.st_ino, index);
+    if (const auto found = chunks.chunks.find(key); found != chunks.chunks.end()) {
+        if (auto chunk = found->second.lock()) return chunk;
+        chunks.chunks.erase(found);
+    }
+    if (static_cast<std::uint64_t>(info.st_size) < (index + 1) * ImportChunkBytes) {
+        failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        step = "a chunk past the end of the shared backing";
+        return nullptr;
+    }
+    udmabuf_create request{};
+    request.memfd = static_cast<std::uint32_t>(file);
+    request.flags = UDMABUF_FLAGS_CLOEXEC;
+    request.offset = index * ImportChunkBytes;
+    request.size = ImportChunkBytes;
+    const int device = udmabufDevice();
+    const int buffer = device < 0 ? -1 : ioctl(device, UDMABUF_CREATE, &request);
+    if (buffer < 0) {
+        failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        step = device < 0 ? "open /dev/udmabuf" : "UDMABUF_CREATE";
+        return nullptr;
+    }
+    VkMemoryFdPropertiesKHR properties{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    if (const auto result = context.Function<PFN_vkGetMemoryFdPropertiesKHR>("vkGetMemoryFdPropertiesKHR")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer, &properties); result != VK_SUCCESS) {
+        close(buffer);
+        failure = result;
+        step = "vkGetMemoryFdPropertiesKHR";
+        return nullptr;
+    }
+    const auto types = properties.memoryTypeBits & bufferTypes;
+    if (types == 0) {
+        close(buffer);
+        failure = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        step = "memory type selection";
+        return nullptr;
+    }
+    const VkImportMemoryFdInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer};
+    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+    allocation.allocationSize = ImportChunkBytes;
+    allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
+    auto chunk = std::make_shared<ImportChunk>();
+    if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &chunk->memory); result != VK_SUCCESS) {
+        close(buffer);
+        failure = result;
+        step = "vkAllocateMemory";
+        return nullptr;
+    }
+    chunk->device = context.device;
+    chunk->freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    chunk->memoryType = allocation.memoryTypeIndex;
+    for (auto it = chunks.chunks.begin(); it != chunks.chunks.end();) it = it->second.expired() ? chunks.chunks.erase(it) : std::next(it);
+    chunks.chunks[key] = chunk;
+    return chunk;
+}
+
+const char* createChunkedDmaBufImport(const Context& context, HostImport& entry, int file, std::uint64_t offset, bool& fits, VkResult& failure) {
+    const auto index = offset / ImportChunkBytes;
+    const auto within = offset - index * ImportChunkBytes;
+    fits = entry.bytes != 0 && within + entry.bytes <= ImportChunkBytes;
+    if (!fits) return nullptr;
+    const VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+    info.size = entry.bytes;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer); result != VK_SUCCESS) {
+        failure = result;
+        return "vkCreateBuffer";
+    }
+    const auto destroy = [&] { context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr); };
+    VkMemoryRequirements requirements{};
+    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+    if (requirements.alignment == 0 || within % requirements.alignment != 0 || within + requirements.size > ImportChunkBytes) {
+        destroy();
+        fits = false;
+        return nullptr;
+    }
+    const char* step = nullptr;
+    auto chunk = importChunk(context, file, index, requirements.memoryTypeBits, step, failure);
+    if (chunk == nullptr) {
+        destroy();
+        return step;
+    }
+    if (((requirements.memoryTypeBits >> chunk->memoryType) & 1u) == 0) {
+        destroy();
+        fits = false;
+        return nullptr;
+    }
+    if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, chunk->memory, within); result != VK_SUCCESS) {
+        destroy();
+        failure = result;
+        return "vkBindBufferMemory";
+    }
+    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+    entry.buffer = buffer;
+    entry.memory = VK_NULL_HANDLE;
+    entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    entry.chunk = std::move(chunk);
+    entry.dmaBuf = true;
+    return nullptr;
+}
+#endif
+
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
     const char* step = createHostPointerImport(context, entry, failure);
 #ifndef _WIN32
     int file = -1;
     std::uint64_t offset = 0;
-    if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), &file, &offset)) step = createDmaBufImport(context, entry, file, offset, failure);
+    if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), &file, &offset)) {
+        bool fits = false;
+        VkResult chunkFailure = VK_SUCCESS;
+        if (createChunkedDmaBufImport(context, entry, file, offset, fits, chunkFailure) == nullptr && fits) {
+            close(file);
+            return nullptr;
+        }
+        step = createDmaBufImport(context, entry, file, offset, failure);
+    }
 #endif
     return step;
 }
@@ -285,8 +482,9 @@ void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
 #ifdef _WIN32
     state.watchDevice = context.device;
-    state.unwatchImports = false;
+    state.unwatchImports = true;
     state.unwatchDmaBufImports = false;
+    if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;
@@ -308,8 +506,8 @@ void decideImportWatch(const Context& context, HostImports& state) {
         state.unwatchImports = true;
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
     } else {
-        state.unwatchImports = probe.writtenAfterSubmit != 0;
-        std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
+        state.unwatchImports = probe.writtenAfterSubmit != 0 || probe.writtenAfterFill != 0;
+        std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
     }
     state.unwatchDmaBufImports = state.unwatchImports;
     if (!context.dmaBufImport) return;
@@ -319,8 +517,8 @@ void decideImportWatch(const Context& context, HostImports& state) {
         std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", dmaBuf.failure, static_cast<int>(dmaBuf.result));
         return;
     }
-    state.unwatchDmaBufImports = dmaBuf.writtenAfterSubmit != 0 || dmaBuf.writtenByCpu == 0;
-    std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: %s (%u of %u scratch pages written after a GPU read, %u after the import, %u seen after a CPU store); imported ranges %s\n", state.unwatchDmaBufImports ? "no" : "yes", dmaBuf.writtenAfterSubmit, dmaBuf.pages, dmaBuf.writtenAtImport, dmaBuf.writtenByCpu, state.unwatchDmaBufImports ? "are compared" : "stay watched");
+    state.unwatchDmaBufImports = dmaBuf.writtenAfterSubmit != 0 || dmaBuf.writtenAfterFill != 0 || dmaBuf.writtenByCpu == 0;
+    std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import, %u seen after a CPU store); imported ranges %s\n", state.unwatchDmaBufImports ? "no" : "yes", dmaBuf.writtenAfterSubmit, dmaBuf.pages, dmaBuf.writtenAfterFill, dmaBuf.writtenAtImport, dmaBuf.writtenByCpu, state.unwatchDmaBufImports ? "are compared" : "stay watched");
 #endif
 }
 
@@ -329,16 +527,75 @@ std::shared_ptr<const GuestAllocations::Range> leasedRangeOwner(const GuestAlloc
     return found != lease.end() && (*found)->address == base ? *found : nullptr;
 }
 
-bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
-    const auto current = leasedRangeOwner(lease, entry.base);
-    return current != nullptr && !entry.range.owner_before(current) && !current.owner_before(entry.range);
+struct ImportRun {
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
+    std::vector<std::shared_ptr<const GuestAllocations::Range>> ranges;
+};
+
+bool continuesRun(const GuestAllocations::Range& before, const GuestAllocations::Range& after) {
+    return before.address + before.bytes == after.address && before.readable && after.readable && before.writable == after.writable && before.gpu == after.gpu;
 }
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
-    if (const auto found = state.imports.find(base); found != state.imports.end()) {
-        if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
-        retireImport(context, state, found, lease);
+std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uint64_t address) {
+    const auto found = std::upper_bound(lease.begin(), lease.end(), address, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (found == lease.begin()) return lease.size();
+    const auto index = static_cast<std::size_t>(std::prev(found) - lease.begin());
+    const auto& range = *lease[index];
+    return range.readable && address < range.address + range.bytes ? index : lease.size();
+}
+
+ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
+    const auto index = leasedIndexContaining(lease, address);
+    if (index == lease.size()) return {};
+    auto first = index;
+    while (first > 0 && continuesRun(*lease[first - 1], *lease[first])) --first;
+    auto last = index;
+    while (last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
+    ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
+    run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return run;
+}
+
+bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    const auto run = importRun(lease, begin);
+    return !run.ranges.empty() && end <= run.base + run.bytes;
+}
+
+bool sameRun(const HostImport& entry, const ImportRun& run) {
+    if (run.base != entry.base || run.bytes != entry.bytes || run.ranges.size() != entry.ranges.size()) return false;
+    for (std::size_t index = 0; index < run.ranges.size(); ++index) {
+        if (entry.ranges[index].owner_before(run.ranges[index]) || run.ranges[index].owner_before(entry.ranges[index])) return false;
     }
+    return true;
+}
+
+bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
+    return sameRun(entry, importRun(lease, entry.base));
+}
+
+const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
+bool importsStale(const Context& context, const HostImports& state);
+
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease) {
+    if (!importsStale(context, state)) {
+        if (const auto* current = findImport(state, address, address + 1)) return current;
+    }
+    auto run = importRun(lease, address);
+    if (run.ranges.empty()) return nullptr;
+    const auto base = run.base;
+    const auto bytes = run.bytes;
+    if (const auto found = state.imports.find(base); found != state.imports.end()) {
+        if (sameRun(found->second, run)) return &found->second;
+        retireImport(context.device, state, found, lease);
+    }
+    for (auto it = state.imports.lower_bound(base); it != state.imports.end() && it->first < base + bytes;) {
+        const auto next = std::next(it);
+        retireImport(context.device, state, it, lease);
+        it = next;
+    }
+    if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
@@ -348,8 +605,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
         return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
     }();
-    std::uint64_t live = 0;
-    for (const auto& [address, existing] : state.imports) live += existing.bytes;
+    const auto live = state.liveBytes;
     if (live + bytes > budget) {
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
@@ -363,7 +619,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return nullptr;
     }
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
-    entry.range = leasedRangeOwner(lease, base);
+    entry.range = run.ranges.front();
+    entry.ranges = std::move(run.ranges);
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
@@ -393,7 +650,18 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
             std::snprintf(text, sizeof(text), "AGC graphics: host import of 0x%llx+0x%llx: memory at 0x%llx (type 0x%lx, protection 0x%lx) is neither read-write, read-only nor a shared mapping", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reinterpret_cast<unsigned long long>(refused.BaseAddress), refused.Type, refused.Protect);
             throw std::runtime_error(text);
         }
-        entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
+        try {
+            entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
+        } catch (const std::runtime_error&) {
+            if (entry.ranges.size() == 1) throw;
+            state.unaliasedSpans.insert(base);
+            return importAllocation(context, state, address, lease);
+        }
+    }
+#else
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
+        state.failed.insert(base);
+        return nullptr;
     }
 #endif
     decideImportWatch(context, state);
@@ -404,6 +672,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return step == nullptr;
     });
     entry.unwatched = step == nullptr && (entry.dmaBuf ? state.unwatchDmaBufImports : state.unwatchImports);
+#ifdef _WIN32
+    if (entry.alias != nullptr) entry.unwatched = false;
+#endif
     if (entry.unwatched) GuestMemory::Unwatch(base, bytes);
     if (step != nullptr) {
 #ifdef _WIN32
@@ -438,9 +709,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-    std::uint64_t liveBytes = bytes;
-    for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
+    state.liveBytes += bytes;
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -472,6 +742,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
 #endif
         }
         state.imports.clear();
+        state.liveBytes = 0;
         state.failed.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
@@ -479,12 +750,14 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.refreshedGeneration = 0;
         ++state.epoch;
     }
+    if (state.destroyBuffer == nullptr) state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+    if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && range->bytes == it->second.bytes && sameRange(it->second, lease)) {
+        if (range != nullptr && sameRange(it->second, lease)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -492,7 +765,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
-        retireImport(context, state, it, lease);
+        retireImport(context.device, state, it, lease);
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
@@ -525,7 +798,10 @@ struct ImageMirrors {
     std::uint64_t builds = 0;
     std::uint64_t heapRefills = 0;
     std::uint64_t heapUnwatched = 0;
+    std::uint64_t heapImported = 0;
+    std::uint64_t heapImportedBytes = 0;
     std::uint64_t subranges = 0;
+    std::uint64_t sparseBinds = 0;
     std::uint64_t rebuilds = 0;
     std::uint64_t refreshes = 0;
     std::uint64_t blocksCompared = 0;
@@ -533,6 +809,11 @@ struct ImageMirrors {
     // Refreshes that had to wait for recorded work writing the range.
     std::uint64_t syncs = 0;
     std::uint64_t serials = 0;
+    std::uint64_t version = 0;
+    std::uint64_t pinnedSpace = 0;
+    std::uint64_t pinnedVersion = 0;
+    std::uint64_t sweeps = 0;
+    std::uint64_t heapChecks = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -586,11 +867,25 @@ std::uint64_t heapMirrorBudget() {
     return bytes;
 }
 
-[[noreturn]] void heapMirrorFatal(const GuestAllocations::Range& range, std::uint64_t held, const char* reason) {
-    std::fprintf(stderr, "FATAL: heap mirror of 0x%llx+0x%llx: %s; heap mirrors hold %llu MiB of %llu MiB (APS5_HEAP_MIRROR_MIB)\n", static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), reason, static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(heapMirrorBudget() >> 20u));
-    std::fflush(stderr);
-    std::abort();
+std::string heapMirrorError(const GuestAllocations::Range& range, std::uint64_t held, std::string_view reason) {
+    constexpr std::string_view prefix = "AGC graphics: ";
+    if (reason.starts_with(prefix)) reason.remove_prefix(prefix.size());
+    char where[64];
+    std::snprintf(where, sizeof(where), "heap mirror of 0x%llx+0x%llx: ", static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes));
+    char holding[96];
+    std::snprintf(holding, sizeof(holding), "; heap mirrors hold %llu MiB of %llu MiB (APS5_HEAP_MIRROR_MIB)", static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(heapMirrorBudget() >> 20u));
+    return std::string(prefix) + where + std::string(reason) + holding;
 }
+
+std::uint64_t heapMirrorsBeside(const GuestAllocations::Range& range) {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    std::uint64_t held = state.heapBytes;
+    if (const auto found = state.entries.find(range.address); found != state.entries.end() && found->second->heap) held -= found->second->bytes;
+    return held;
+}
+
+void sweepMirrors();
 
 bool sameRange(const std::weak_ptr<const GuestAllocations::Range>& mirrored, const std::shared_ptr<const GuestAllocations::Range>& range) {
     return !mirrored.owner_before(range) && !range.owner_before(mirrored);
@@ -602,12 +897,22 @@ struct RefreshBlock {
     std::uint64_t address;
     std::size_t length;
     std::uint64_t generation = 0;
+    std::uint8_t fill = 0;
 };
+
+constexpr std::uint8_t SparseCopy = 1;
+constexpr std::uint8_t SparseZero = 2;
 
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
 bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
+    if (block.fill != 0) {
+        auto* target = block.mirror->buffer->Bytes().data() + offset;
+        if (block.fill == SparseZero) std::memset(target, 0, block.length);
+        else std::memcpy(target, guest, block.length);
+        return true;
+    }
     if (block.mirror->heap) {
         std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
         block.mirror->generations[static_cast<std::size_t>(block.address / 65536 - block.mirror->base / 65536)] = block.generation;
@@ -716,10 +1021,7 @@ private:
 // completes first, so its results reach the guest and the shadow before the compare and no batch
 // writes a block being replaced; GPU reads of the mirror by earlier recorded work (an address-based
 // dispatch whose lease is released at completion) see the newer bytes, as they would on hardware.
-void prepareRange(std::uint64_t address, std::uint64_t bytes) {
-    // The compare reads the pages directly; a mirror is only reused while its Range exists, but a
-    // lease of a build in flight can keep a replaced Range alive past a protection change.
-    Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+void syncRange(std::uint64_t address, std::uint64_t bytes) {
     // Named for the [hooksync] attribution: the flush goes through the hook, which waits when
     // recorded work notes a write inside the range (a descriptor written inside a writable exe
     // range; the lease itself maps the range read-only). The access is the whole range.
@@ -732,6 +1034,11 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes) {
         recorder->Sync();
     }
     ++state.refreshes;
+}
+
+void prepareRange(std::uint64_t address, std::uint64_t bytes) {
+    Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+    syncRange(address, bytes);
 }
 
 bool prepareRefresh(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
@@ -767,11 +1074,30 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
     compareBlocks(blocks);
 }
 
-void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
+void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
     constexpr std::uint64_t block = 65536;
-    std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
     thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
     auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    Mirrors().heapChecks += mirrors.size();
+    for (auto* const pointer : mirrors) {
+        auto& mirror = *pointer;
+        changed.assign(mirror.generations.size(), 0);
+        GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
+        const auto aligned = mirror.base / block * block;
+        const auto end = mirror.base + mirror.bytes;
+        bool refilled = false;
+        for (std::size_t at = 0; at < changed.size(); ++at) {
+            if (changed[at] == 0) continue;
+            const auto from = std::max(mirror.base, aligned + at * block);
+            blocks.push_back({&mirror, from, static_cast<std::size_t>(std::min(end, aligned + (at + 1) * block) - from), generation});
+            refilled = true;
+        }
+        if (refilled) ++Mirrors().heapRefills;
+    }
+}
+
+void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
+    std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
     for (std::size_t first = 0; first < mirrors.size();) {
         auto last = first + 1;
         while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes) ++last;
@@ -780,23 +1106,146 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         prepareRange(begin, bytes);
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
-        for (auto index = first; index < last; ++index) {
-            auto& mirror = *mirrors[index];
-            changed.assign(mirror.generations.size(), 0);
-            GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
-            const auto aligned = mirror.base / block * block;
-            const auto end = mirror.base + mirror.bytes;
-            bool refilled = false;
-            for (std::size_t at = 0; at < changed.size(); ++at) {
-                if (changed[at] == 0) continue;
-                const auto from = std::max(mirror.base, aligned + at * block);
-                blocks.push_back({&mirror, from, static_cast<std::size_t>(std::min(end, aligned + (at + 1) * block) - from), generation});
-                refilled = true;
-            }
-            if (refilled) ++Mirrors().heapRefills;
-        }
+        appendChangedBlocks(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
         first = last;
     }
+}
+
+bool sparseMirrorsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_SPARSE_HEAP_MIRROR") != nullptr;
+    return !disabled;
+}
+
+using Pieces = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+std::uint64_t sparseExtent(std::uint64_t base, std::uint64_t reserved, const Pieces& pieces) {
+    constexpr std::uint64_t granule = std::uint64_t{1} << 20u;
+    const auto used = pieces.empty() ? 0 : pieces.back().second - base;
+    const auto wanted = used + used / 8;
+    return std::min(reserved, std::max<std::uint64_t>(granule, (wanted + granule - 1) / granule * granule));
+}
+
+std::uint64_t collectPieces(const Pieces& pieces) {
+    std::uint64_t generation = 0;
+    for (const auto& [first, last] : pieces) {
+        generation = GuestMemory::CollectWrites(first, static_cast<std::size_t>(last - first));
+        if (generation == 0) return 0;
+    }
+    return generation != 0 ? generation : GuestMemory::TrackerGeneration();
+}
+
+bool covers(const Pieces& pieces, std::uint64_t address) {
+    return std::any_of(pieces.begin(), pieces.end(), [&](const auto& piece) { return piece.first <= address && address < piece.second; });
+}
+
+void forgetCommitChanges(ImageMirror& mirror, const Pieces& pieces) {
+    if (pieces == mirror.committed) return;
+    std::vector<std::uint64_t> edges;
+    for (const auto* list : std::array<const Pieces*, 2>{&pieces, &mirror.committed}) {
+        for (const auto& [first, last] : *list) {
+            edges.push_back(first);
+            edges.push_back(last);
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    constexpr std::uint64_t block = 65536;
+    const auto end = mirror.base + mirror.bytes;
+    for (std::size_t at = 0; at + 1 < edges.size(); ++at) {
+        const auto from = std::max(edges[at], mirror.base);
+        const auto to = std::min(edges[at + 1], end);
+        if (from >= to || covers(pieces, from) == covers(mirror.committed, from)) continue;
+        for (auto index = from / block - mirror.base / block; index <= (to - 1) / block - mirror.base / block; ++index) mirror.generations[static_cast<std::size_t>(index)] = 0;
+    }
+}
+
+void appendSparseBlocks(ImageMirror& mirror, Pieces pieces, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
+    constexpr std::uint64_t block = 65536;
+    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
+    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    forgetCommitChanges(mirror, pieces);
+    ++Mirrors().heapChecks;
+    changed.assign(mirror.generations.size(), 0);
+    GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
+    const auto aligned = mirror.base / block * block;
+    const auto end = mirror.base + mirror.bytes;
+    bool refilled = false;
+    std::size_t piece = 0;
+    for (std::size_t at = 0; at < changed.size(); ++at) {
+        if (changed[at] == 0) continue;
+        refilled = true;
+        mirror.generations[at] = generation;
+        const auto from = std::max(mirror.base, aligned + at * block);
+        const auto to = std::min(end, aligned + (at + 1) * block);
+        auto cursor = from;
+        while (piece < pieces.size() && pieces[piece].second <= from) ++piece;
+        for (auto next = piece; next < pieces.size() && pieces[next].first < to; ++next) {
+            const auto first = std::max(pieces[next].first, from);
+            const auto last = std::min(pieces[next].second, to);
+            if (cursor < first) blocks.push_back({&mirror, cursor, static_cast<std::size_t>(first - cursor), 0, SparseZero});
+            blocks.push_back({&mirror, first, static_cast<std::size_t>(last - first), 0, SparseCopy});
+            cursor = last;
+        }
+        if (cursor < to) blocks.push_back({&mirror, cursor, static_cast<std::size_t>(to - cursor), 0, SparseZero});
+    }
+    if (refilled) ++Mirrors().heapRefills;
+    mirror.committed = std::move(pieces);
+}
+
+Pieces clipPieces(const Pieces& pieces, std::uint64_t begin, std::uint64_t end) {
+    Pieces result;
+    for (const auto& [first, last] : pieces) {
+        if (std::max(first, begin) < std::min(last, end)) result.emplace_back(std::max(first, begin), std::min(last, end));
+    }
+    return result;
+}
+
+bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks) {
+    auto pieces = GuestMemory::DescribeCommitted(mirror.base, static_cast<std::size_t>(mirror.reserved)).ranges;
+    if (!pieces.empty() && pieces.back().second > mirror.base + mirror.bytes) return false;
+    syncRange(mirror.base, mirror.bytes);
+    const auto generation = collectPieces(pieces);
+    Require(generation != 0, "a sparse heap mirror's range is no longer write-watched");
+    appendSparseBlocks(mirror, std::move(pieces), generation, blocks);
+    return true;
+}
+
+void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
+    for (std::size_t index = 0; index < space.base.size(); ++index) {
+        const auto& region = space.base[index];
+        if (region.mirror == nullptr) continue;
+        space.mirrored = true;
+        if (!region.mirror->heap) {
+            if (region.mirror->writable) space.writableMirrors.push_back(index);
+            continue;
+        }
+        auto* mirror = region.mirror.get();
+        if (mirror->sparse) {
+            space.sparseMirrors.push_back(mirror);
+            continue;
+        }
+        if (space.heapRuns.empty() || mirror->base != space.heapMirrors.back()->base + space.heapMirrors.back()->bytes) space.heapRuns.push_back({mirror->base, 0, space.heapMirrors.size(), 0});
+        space.heapMirrors.push_back(mirror);
+        auto& run = space.heapRuns.back();
+        run.bytes = mirror->base + mirror->bytes - run.begin;
+        run.last = space.heapMirrors.size();
+    }
+    space.verified = std::make_unique<std::atomic<std::uint64_t>[]>(space.heapRuns.size());
+}
+
+std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    std::vector<std::pair<std::size_t, std::uint64_t>> checked;
+    checked.reserve(space.heapRuns.size());
+    for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {
+        const auto& run = space.heapRuns[index];
+        prepareRange(run.begin, run.bytes);
+        const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
+        Require(generation != 0, "a heap mirror's range is no longer write-watched");
+        const auto since = space.verified[index].load(std::memory_order_relaxed);
+        if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
+        checked.emplace_back(index, generation);
+    }
+    return checked;
 }
 
 // The mirror for a leased image range: the existing one, or a new one when none exists or the
@@ -812,40 +1261,59 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             state.failed.clear();
             state.heapBytes = 0;
             state.device = context.device;
+            ++state.version;
         }
         if (state.failed.contains(range->address)) return nullptr;
         const auto found = state.entries.find(range->address);
-        if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->bytes == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
+        if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->reserved == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
     }
     if (mirror != nullptr) {
-        if (!heap && prepareRefresh(*mirror, range->address, range->bytes)) appendBlocks(blocks, *mirror, range->address, range->bytes);
-        return mirror;
+        if (!mirror->sparse) {
+            if (!heap && prepareRefresh(*mirror, range->address, range->bytes)) appendBlocks(blocks, *mirror, range->address, range->bytes);
+            return mirror;
+        }
+        if (refreshSparseMirror(*mirror, blocks)) return mirror;
     }
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap)) return nullptr;
+    Pieces pieces;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap)) {
+        if (!heap || !sparseMirrorsEnabled()) return nullptr;
+        pieces = GuestMemory::DescribeCommitted(range->address, range->bytes).ranges;
+        if (pieces.empty()) return nullptr;
+    }
+    const bool sparse = !pieces.empty();
     mirror = std::make_shared<ImageMirror>();
     mirror->base = range->address;
-    mirror->bytes = range->bytes;
+    mirror->bytes = sparse ? sparseExtent(range->address, range->bytes, pieces) : range->bytes;
+    mirror->reserved = range->bytes;
+    mirror->sparse = sparse;
     mirror->writable = range->writable;
     mirror->heap = heap;
     mirror->range = range;
     if (heap) {
-        prepareRefresh(*mirror, range->address, range->bytes);
-        const auto generation = GuestMemory::CollectWrites(range->address, range->bytes);
+        std::uint64_t generation = 0;
+        if (sparse) {
+            syncRange(mirror->base, mirror->bytes);
+            if (GuestMemory::Watched(mirror->base, static_cast<std::size_t>(mirror->bytes))) generation = collectPieces(pieces);
+        } else {
+            prepareRefresh(*mirror, range->address, range->bytes);
+            generation = GuestMemory::CollectWrites(range->address, range->bytes);
+        }
         constexpr std::uint64_t block = 65536;
-        mirror->generations.assign(static_cast<std::size_t>(((range->address + range->bytes + block - 1) / block) - range->address / block), generation);
-        std::lock_guard lock(state.mutex);
+        mirror->generations.assign(static_cast<std::size_t>(((mirror->base + mirror->bytes + block - 1) / block) - mirror->base / block), generation);
         if (generation == 0) {
+            std::lock_guard lock(state.mutex);
             ++state.heapUnwatched;
             return nullptr;
         }
-        std::uint64_t held = state.heapBytes;
-        if (const auto found = state.entries.find(range->address); found != state.entries.end() && found->second->heap) held -= found->second->bytes;
-        if (held + range->bytes > heapMirrorBudget()) heapMirrorFatal(*range, held, "past the budget");
+        if (heapMirrorsBeside(*range) + mirror->bytes > heapMirrorBudget()) {
+            sweepMirrors();
+            if (const auto held = heapMirrorsBeside(*range); held + mirror->bytes > heapMirrorBudget()) throw std::runtime_error(heapMirrorError(*range, held, "past the budget"));
+        }
     }
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     } catch (const std::runtime_error& error) {
-        if (heap) heapMirrorFatal(*range, state.heapBytes, error.what());
+        if (heap) throw std::runtime_error(heapMirrorError(*range, heapMirrorsBeside(*range), error.what()));
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
         std::lock_guard lock(state.mutex);
         state.failed.insert(range->address);
@@ -855,7 +1323,17 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     // named for the [hooksync] attribution like the refresh's flush.
     {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
-        GuestMemory::Read(range->address, mirror->buffer->Bytes());
+        const auto target = mirror->buffer->Bytes().first(static_cast<std::size_t>(mirror->bytes));
+        if (!sparse) GuestMemory::Read(range->address, target);
+        std::size_t cursor = 0;
+        for (const auto& [first, last] : pieces) {
+            const auto at = static_cast<std::size_t>(first - mirror->base);
+            std::memset(target.data() + cursor, 0, at - cursor);
+            GuestMemory::Read(first, target.subspan(at, static_cast<std::size_t>(last - first)));
+            cursor = static_cast<std::size_t>(last - mirror->base);
+        }
+        if (sparse) std::memset(target.data() + cursor, 0, target.size() - cursor);
+        mirror->committed = std::move(pieces);
     }
     if (range->writable && !heap) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
     std::lock_guard lock(state.mutex);
@@ -865,6 +1343,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     if (const auto found = state.entries.find(range->address); found != state.entries.end() && found->second->heap) state.heapBytes -= found->second->bytes;
     if (heap) state.heapBytes += mirror->bytes;
     state.entries[range->address] = mirror;
+    ++state.version;
     return mirror;
 }
 
@@ -882,15 +1361,44 @@ std::shared_ptr<ImageMirror> findMirror(const Context& context, std::uint64_t be
 
 // Drops mirrors whose registered range is gone (a later build made a new one for the replacement).
 void sweepMirrors() {
+    const auto space = Spaces().current.load();
     auto& state = Mirrors();
     std::lock_guard lock(state.mutex);
+    if (space != nullptr && state.pinnedSpace == space->serial && state.pinnedVersion == state.version) return;
+    ++state.sweeps;
+    bool pinned = space != nullptr;
+    std::size_t leased = 0;
     for (auto it = state.entries.begin(); it != state.entries.end();) {
         if (!it->second->range.expired()) {
+            if (pinned) {
+                while (leased < space->lease.size() && space->lease[leased]->address < it->first) ++leased;
+                pinned = leased < space->lease.size() && sameRange(it->second->range, space->lease[leased]);
+            }
             ++it;
             continue;
         }
         if (it->second->heap) state.heapBytes -= it->second->bytes;
         it = state.entries.erase(it);
+        ++state.version;
+    }
+    state.pinnedSpace = pinned ? space->serial : 0;
+    state.pinnedVersion = state.version;
+}
+
+void releaseImportedMirrors(const Context& context, const std::vector<std::uint64_t>& imported) {
+    if (imported.empty()) return;
+    std::vector<std::shared_ptr<ImageMirror>> released;
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    if (state.device != context.device || state.entries.empty()) return;
+    for (const auto base : imported) {
+        const auto found = state.entries.find(base);
+        if (found == state.entries.end() || !found->second->heap) continue;
+        state.heapBytes -= found->second->bytes;
+        ++state.heapImported;
+        state.heapImportedBytes += found->second->bytes;
+        released.push_back(std::move(found->second));
+        state.entries.erase(found);
     }
 }
 
@@ -916,7 +1424,7 @@ void reportMirrors() {
         }
         heapBytes = state.heapBytes;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] image mirrors: %zu ranges (%.1f MiB, %zu writable, %zu heap %.1f MiB), %llu address-based builds served, %llu descriptor sub-ranges bound, %llu rebuilds, %llu refreshes: %llu blocks compared, %llu copied, %llu refresh syncs; heap refills %llu, unwatched heaps %llu\n", count, bytes / 1048576.0, writable, heaps, heapBytes / 1048576.0, static_cast<unsigned long long>(state.builds), static_cast<unsigned long long>(state.subranges), static_cast<unsigned long long>(state.rebuilds), static_cast<unsigned long long>(state.refreshes), static_cast<unsigned long long>(state.blocksCompared), static_cast<unsigned long long>(state.blocksCopied), static_cast<unsigned long long>(state.syncs), static_cast<unsigned long long>(state.heapRefills), static_cast<unsigned long long>(state.heapUnwatched));
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] image mirrors: %zu ranges (%.1f MiB, %zu writable, %zu heap %.1f MiB), %llu address-based builds served, %llu descriptor sub-ranges bound, %llu sparse heaps bound, %llu rebuilds, %llu refreshes: %llu blocks compared, %llu copied, %llu refresh syncs; heap refills %llu, unwatched heaps %llu, %llu heap mirrors released for imports (%.1f MiB)\n", count, bytes / 1048576.0, writable, heaps, heapBytes / 1048576.0, static_cast<unsigned long long>(state.builds), static_cast<unsigned long long>(state.subranges), static_cast<unsigned long long>(state.sparseBinds), static_cast<unsigned long long>(state.rebuilds), static_cast<unsigned long long>(state.refreshes), static_cast<unsigned long long>(state.blocksCompared), static_cast<unsigned long long>(state.blocksCopied), static_cast<unsigned long long>(state.syncs), static_cast<unsigned long long>(state.heapRefills), static_cast<unsigned long long>(state.heapUnwatched), static_cast<unsigned long long>(state.heapImported), state.heapImportedBytes / 1048576.0);
 }
 
 // Deferred lease release. The lease an address-based build takes (AcquireRegistered) is dropped by its
@@ -962,10 +1470,11 @@ SnapshotStats& Snapshots() {
     return stats;
 }
 
-bool WaitForLeases() noexcept {
+bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept {
     const auto start = std::chrono::steady_clock::now();
     bool synced = false;
     bool drained = false;
+    bool retiredImport = false;
     // A range pinned only by the cached address space is released by dropping the cache's
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
@@ -982,7 +1491,42 @@ bool WaitForLeases() noexcept {
         return true;
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) {
-        std::this_thread::yield();
+        try {
+            auto* recorder = Recorder::Active();
+            if (recorder != nullptr && !recorder->Idle()) {
+                Recorder::CountSync(4);
+                recorder->Sync();
+                synced = true;
+                drained = true;
+            }
+            if (recorder != nullptr) recorder->FlushDeferredReleases();
+            const auto end = static_cast<std::uint64_t>(address) + bytes;
+            auto& imports = Imports();
+            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            {
+                std::lock_guard importsLock(imports.mutex);
+                for (auto it = imports.imports.begin(); it != imports.imports.end();) {
+                    const auto base = it->first;
+                    if (base >= end || address >= base + it->second.bytes) {
+                        ++it;
+                        continue;
+                    }
+                    const auto next = std::next(it);
+                    retireImport(imports.device, imports, it, lease);
+                    it = next;
+                    retiredImport = true;
+                }
+            }
+            if (retiredImport && recorder != nullptr && !recorder->Idle()) {
+                Recorder::CountSync(4);
+                recorder->Sync();
+                synced = true;
+                drained = true;
+            }
+            if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
+        }
     } else {
         try {
             std::lock_guard lock(GuestMemory::GpuMutex());
@@ -1006,6 +1550,48 @@ bool WaitForLeases() noexcept {
                 // yet to record (a test's, or a build whose worker gave up the lock); give it time.
                 std::this_thread::yield();
             }
+
+            const auto end = static_cast<std::uint64_t>(address) + bytes;
+            auto& imports = Imports();
+            bool overlapsImport = false;
+            {
+                std::lock_guard importsLock(imports.mutex);
+                for (const auto& [base, entry] : imports.imports) {
+                    if (base < end && address < base + entry.bytes) {
+                        overlapsImport = true;
+                        break;
+                    }
+                }
+            }
+            if (overlapsImport) {
+                if (recorder != nullptr && !recorder->Idle()) {
+                    Recorder::CountSync(4);
+                    recorder->Sync();
+                    synced = true;
+                    drained = true;
+                }
+                const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+                {
+                    std::lock_guard importsLock(imports.mutex);
+                    for (auto it = imports.imports.begin(); it != imports.imports.end();) {
+                        const auto base = it->first;
+                        if (base >= end || address >= base + it->second.bytes) {
+                            ++it;
+                            continue;
+                        }
+                        const auto next = std::next(it);
+                        retireImport(imports.device, imports, it, lease);
+                        it = next;
+                        retiredImport = true;
+                    }
+                }
+                if (retiredImport && recorder != nullptr && !recorder->Idle()) {
+                    Recorder::CountSync(4);
+                    recorder->Sync();
+                    synced = true;
+                    drained = true;
+                }
+            }
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
         }
@@ -1016,12 +1602,12 @@ bool WaitForLeases() noexcept {
     if (synced) ++state.stats.contentionSyncs;
     if (drained) ++state.stats.contentionDrains;
     state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    return synced;
+    return synced || retiredImport;
 }
 
 void ensurePinWaiter() {
     static const bool registered = [] {
-        GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(&WaitForLeases);
+        GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(&WaitForLeasesAndImports);
         return true;
     }();
     static_cast<void>(registered);
@@ -1094,7 +1680,7 @@ std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t l
 MirrorStats MirrorCounters() {
     auto& state = Mirrors();
     std::lock_guard lock(state.mutex);
-    MirrorStats stats{0, state.heapBytes, state.rebuilds, state.blocksCopied, state.heapRefills};
+    MirrorStats stats{0, state.heapBytes, state.rebuilds, state.blocksCopied, state.heapRefills, state.sweeps, state.heapChecks, state.sparseBinds};
     for (const auto& [base, mirror] : state.entries) stats.heapMirrors += mirror->heap ? 1 : 0;
     return stats;
 }
@@ -1110,6 +1696,26 @@ void ClearImageMirrors(VkDevice device) {
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
     }
+    Spaces().current.store(nullptr);
+}
+
+void ClearHostImports(VkDevice device) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (state.device != device) return;
+    for (const auto& [address, entry] : state.imports) {
+        state.destroyBuffer(state.device, entry.buffer, nullptr);
+        state.freeMemory(state.device, entry.memory, nullptr);
+#ifdef _WIN32
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+#endif
+    }
+    state.imports.clear();
+    state.liveBytes = 0;
+    state.failed.clear();
+    state.device = VK_NULL_HANDLE;
+    state.refreshedGeneration = 0;
+    ++state.epoch;
 }
 
 #ifndef _WIN32
@@ -1120,7 +1726,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
     HostImport import{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     VkBuffer destination = VK_NULL_HANDLE;
     VkDeviceMemory destinationMemory = VK_NULL_HANDLE;
-    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkCommandBuffer commands[2]{};
     VkFence fence = VK_NULL_HANDLE;
     bool submitted = false;
     const auto collect = [&](std::uint32_t& pages) {
@@ -1150,24 +1756,34 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         allocate.commandPool = context.pool;
         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocate.commandBufferCount = 1;
-        if ((probe.result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &commands)) != VK_SUCCESS) return "vkAllocateCommandBuffers";
+        allocate.commandBufferCount = 2;
+        if ((probe.result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, commands)) != VK_SUCCESS) return "vkAllocateCommandBuffers";
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
+        if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[0], &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
         const VkBufferCopy region{0, 0, bytes};
-        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, import.buffer, destination, 1, &region);
-        if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands)) != VK_SUCCESS) return "vkEndCommandBuffer";
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands[0], import.buffer, destination, 1, &region);
+        if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[0])) != VK_SUCCESS) return "vkEndCommandBuffer";
+        if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[1], &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands[1], import.buffer, 0, bytes, 0x02020202u);
+        if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[1])) != VK_SUCCESS) return "vkEndCommandBuffer";
         const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if ((probe.result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence)) != VK_SUCCESS) return "vkCreateFence";
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &commands;
-        if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
-        submitted = true;
-        if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
-        submitted = false;
+        const auto execute = [&](VkCommandBuffer buffer) -> const char* {
+            if ((probe.result = context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &fence)) != VK_SUCCESS) return "vkResetFences";
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &buffer;
+            if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+            submitted = true;
+            if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
+            submitted = false;
+            return nullptr;
+        };
+        if (const char* step = execute(commands[0])) return step;
         if (!collect(probe.writtenAfterSubmit)) return "the collect after the submission";
+        if (const char* step = execute(commands[1])) return step;
+        if (!collect(probe.writtenAfterFill)) return "the collect after the fill";
         *reinterpret_cast<volatile std::uint8_t*>(base) = 2;
         if (!collect(probe.writtenByCpu)) return "the collect after a CPU store";
         return nullptr;
@@ -1175,7 +1791,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
     probe.failure = run();
     if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
-    if (commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
     if (destinationMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr);
     if (import.buffer != VK_NULL_HANDLE) destroyImport(context, import);
@@ -1283,6 +1899,7 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
 
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    ensurePinWaiter();
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
@@ -1291,14 +1908,49 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
-    return nullptr;
+    if (!runCovers(lease, address, address + bytes)) return nullptr;
+    const auto* entry = importAllocation(context, state, address, lease);
+    return entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
+}
+
+bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
+    if (context.hostImportAlignment == 0) return true;
+    ensurePinWaiter();
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (!adoptDevice && (state.device != context.device || state.watchDevice != context.device)) return false;
+    const bool adopting = state.device != context.device;
+    GuestAllocations::Lease current;
+    if (adopting) {
+        current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        refreshImports(context, state, current);
+    } else if (state.refreshedGeneration > generation) {
+        return true;
+    }
+    if (!adopting) current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    for (const auto& mapped : ranges) {
+        const auto range = mapped.lock();
+        if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
+        try {
+            if (importAllocation(context, state, range->address, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
+        }
+    }
+    return true;
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     return containingRange(lease, address, address + bytes) != nullptr;
+}
+
+std::uint64_t RegisteredReadableEnd(std::uint64_t address) {
+    if (address == std::numeric_limits<std::uint64_t>::max()) return 0;
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto* range = containingRange(lease, address, address + 1);
+    return range != nullptr ? range->address + range->bytes : 0;
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -1364,6 +2016,7 @@ void GuestBufferMemory::AcquireRegistered() {
     std::vector<RefreshBlock> blocks;
     std::vector<ImageMirror*> heaps;
     bool mirrored = false;
+    bool served = false;
     auto& spaces = Spaces();
     // Read before the lease below is acquired: a mutation ending in between leaves the space
     // stale by its generation, never newer than it (see AddressSpace).
@@ -1381,6 +2034,15 @@ void GuestBufferMemory::AcquireRegistered() {
             else hit = true;
         }
         if (hit) {
+            for (auto* mirror : current->sparseMirrors) {
+                if (refreshSparseMirror(*mirror, blocks)) continue;
+                hit = false;
+                blocks.clear();
+                spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
+                break;
+            }
+        }
+        if (hit) {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
             lap(timing.leaseUs, at);
@@ -1391,11 +2053,11 @@ void GuestBufferMemory::AcquireRegistered() {
             // an existing mirror. The preparation may wait for recorded work, whose completions can
             // retire an import the space's regions point at: UploadFinish re-checks the epoch
             // before any of them is dereferenced.
-            for (const auto& region : space->base) {
-                if (region.mirror == nullptr) continue;
-                mirrored = true;
-                if (region.mirror->heap) heaps.push_back(region.mirror.get());
-                else if (region.mirror->writable && prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+            served = true;
+            mirrored = space->mirrored;
+            for (const auto index : space->writableMirrors) {
+                const auto& region = space->base[index];
+                if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
             }
             lap(timing.mirrorsUs, at);
         }
@@ -1420,15 +2082,16 @@ void GuestBufferMemory::AcquireRegistered() {
         // must not happen under it.
         regions.reserve(lease.size());
         std::vector<AddressCopy> copies;
+        std::vector<std::uint64_t> imported;
         for (const auto& range : lease) {
-            if (!range->readable) continue;
+            if (!range->readable || !range->gpu) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
             if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, range->bytes, lease);
+                entry = importAllocation(context, state, range->address, lease);
             }
             lap(timing.importsUs, at);
             if (entry != nullptr) {
@@ -1436,6 +2099,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 // Reused by Upload while no import was dropped since (see importsEpoch).
                 region.direct = entry;
                 regions.push_back(std::move(region));
+                imported.push_back(range->address);
                 continue;
             }
             if (mirrorsEnabled()) {
@@ -1443,7 +2107,12 @@ void GuestBufferMemory::AcquireRegistered() {
                 lap(timing.mirrorsUs, at);
                 if (region.mirror != nullptr) {
                     mirrored = true;
-                    if (region.mirror->heap) heaps.push_back(region.mirror.get());
+                    if (region.mirror->sparse) {
+                        region.sparse = true;
+                        region.backed = region.mirror->committed;
+                    } else if (region.mirror->heap) {
+                        heaps.push_back(region.mirror.get());
+                    }
                     regions.push_back(std::move(region));
                     continue;
                 }
@@ -1458,6 +2127,7 @@ void GuestBufferMemory::AcquireRegistered() {
             const char* reason = !mirrorsEnabled() ? "mirrors disabled by APS5_NO_LEASE_MIRROR" : copied.sparse ? "unreadable pages" : !range->releasable ? "image mirror refused" : "outside the write-watched arena";
             copies.push_back({copied.begin, copied.end, committed, reason});
         }
+        releaseImportedMirrors(context, imported);
         regionsSorted = sortedLookup;
         static const std::uint64_t copyLimit = [] {
             const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
@@ -1507,16 +2177,20 @@ void GuestBufferMemory::AcquireRegistered() {
                 }
                 regions = std::move(extras);
                 lease.clear();
+                planSpaceMirrors(*built);
                 space = std::move(built);
                 spaces.droppedByWaiter.store(false, std::memory_order_relaxed);
                 spaces.current.store(space);
             }
         }
     }
-    refreshHeapMirrors(heaps, blocks);
+    std::vector<std::pair<std::size_t, std::uint64_t>> checked;
+    if (served) checked = refreshHeapRuns(*space, blocks);
+    else refreshHeapMirrors(heaps, blocks);
     lap(timing.mirrorsUs, at);
     const auto copiedBefore = Mirrors().blocksCopied;
     compareBlocks(blocks);
+    for (const auto& [run, collected] : checked) space->verified[run].store(collected, std::memory_order_relaxed);
     lap(timing.compareUs, at);
     if (profile) {
         timing.blocksCompared += blocks.size();
@@ -1602,10 +2276,17 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     return own;
 }
 
-void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic) {
+void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
     validate(address, bytes);
-    switch (baseOverlap(address, address + bytes, nullptr)) {
+    const auto begin = address & ~std::uint64_t{3};
+    const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
+    const Region* inside = nullptr;
+    switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
+            if (!servesView(*inside, begin)) {
+                dissolveSpace(false);
+                break;
+            }
             return;
         case BaseOverlap::Partial:
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
@@ -1616,20 +2297,64 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     }
     // `writable` here means the bytes come from live guest memory (not a snapshot), whether or not
     // the shader stores to them; what is written back is decided by Writes() alone.
-    Region region{address, address + bytes, true, {}, nullptr};
+    Region region{begin, end, true, {}, nullptr};
     region.atomic = atomic;
-    auto committed = GuestMemory::DescribeCommitted(address, bytes);
+    region.swept = swept;
+    region.lastView = begin;
+    auto committed = GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin));
     if (!committed.whole) {
         // A GPU heap bound whole while the guest commits its pages on demand, or a descriptor left
         region.sparse = true;
+        region.sparseHeap = true;
         region.backed = std::move(committed.ranges);
     }
     regions.push_back(std::move(region));
     regionsSorted = false;
 }
 
-void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic) {
-    addDescriptorRegion(address, bytes, atomic);
+bool GuestBufferMemory::servesView(const Region& region, std::uint64_t view) {
+    return region.mirror == nullptr || view + 4 <= region.mirror->base + region.mirror->bytes;
+}
+
+bool GuestBufferMemory::sparseHeapCandidate(const Region& region) {
+    return region.sparseHeap && region.sparse && region.mirror == nullptr && region.direct == nullptr && (region.hostBacked || region.writable) && mirrorsEnabled() && sparseMirrorsEnabled();
+}
+
+bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations::Lease& lease) {
+    const auto backedEnd = region.backed.empty() ? region.begin : region.backed.back().second;
+    const auto neededEnd = std::min(region.end, std::max(backedEnd, std::max(region.lastView, region.begin) + 4u));
+    const auto* range = containingRange(lease, region.begin, neededEnd);
+    if (range == nullptr || !range->releasable) return false;
+    std::vector<RefreshBlock> blocks;
+    std::shared_ptr<ImageMirror> mirror;
+    try {
+        mirror = acquireMirror(context, leasedRangeOwner(lease, range->address), blocks, true);
+    } catch (const std::runtime_error& error) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[gpu] %s; copying the sparse heap instead\n", error.what());
+        return false;
+    }
+    if (mirror != nullptr && mirror->heap && !mirror->sparse) {
+        std::vector<ImageMirror*> whole{mirror.get()};
+        refreshHeapMirrors(whole, blocks);
+    }
+    compareBlocks(blocks);
+    if (mirror == nullptr || !mirror->heap || region.begin < mirror->base || (region.begin - mirror->base) % context.limits.minStorageBufferOffsetAlignment != 0) return false;
+    region.mirror = std::move(mirror);
+    if (!servesView(region, std::max(region.lastView, region.begin))) {
+        region.mirror = nullptr;
+        return false;
+    }
+    if (region.mirror->sparse) region.backed = clipPieces(region.mirror->committed, region.begin, region.end);
+    else region.backed = clipPieces({{region.mirror->base, region.mirror->base + region.mirror->bytes}}, region.begin, region.end);
+    region.snapshot.clear();
+    std::lock_guard lock(Mirrors().mutex);
+    ++Mirrors().sparseBinds;
+    return true;
+}
+
+void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
+    addDescriptorRegion(address, bytes, atomic, swept);
     writes.emplace_back(address, address + bytes);
 }
 
@@ -1637,7 +2362,7 @@ void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
     // Not in `writes`: no reference copy (copyRegion), no write-back, no pending-write note, no
     // direct-write mark, and UploadPrepare copies it without the device lock. A written descriptor
     // overlapping the range still covers it through its own Writes() entry.
-    addDescriptorRegion(address, bytes, false);
+    addDescriptorRegion(address, bytes, false, false);
 }
 
 void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
@@ -1760,6 +2485,8 @@ VkBufferUsageFlags gpuCopyUsage(bool addressable) {
 // APS5_WRITTEN_SHADOW_MIN_KIB / APS5_WRITTEN_SHADOW_MAX_KIB (16 / 2048) bound the written window
 // (a kernel streaming once through a large buffer, the engine's memcpy kernel over 4-8 MiB video
 // frames, would only gain the two copies), APS5_ATOMIC_STAGE_MAX_KIB (1024) the atomic one.
+constexpr std::uint64_t SweptShadowMax = std::uint64_t{16} << 20u;
+
 bool writtenShadowEnabled() {
     static const bool disabled = std::getenv("APS5_NO_WRITTEN_SHADOW") != nullptr;
     return !disabled;
@@ -1890,12 +2617,17 @@ bool GuestBufferMemory::gpuCopyEligible(const Region& region) const {
     return region.end - region.begin <= gpuCopyLimit();
 }
 
+bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) const {
+    if (adjustedRegions && !addressable) return offset % 4 == 0;
+    return offset % context.limits.minStorageBufferOffsetAlignment == 0;
+}
+
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
     if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
-    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
+    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
@@ -1929,12 +2661,17 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 // crossing the mirror's end cannot be served by it: this build copies the range.
                 if (previous.mirror == nullptr) std::swap(previous, region);
                 Require(region.mirror == nullptr, "image mirrors overlap");
-                if (region.begin >= previous.begin && region.end <= previous.end) continue;
+                if (region.begin >= previous.begin && region.end <= previous.end && servesView(previous, std::max(region.lastView, region.begin))) continue;
+                if (previous.mirror->sparse) previous.backed = clipPieces(previous.mirror->committed, previous.begin, previous.end);
                 previous.mirror = nullptr;
                 previous.hostBacked = true;
             }
             mergeBacked(previous, region);
+            previous.lastView = std::max({previous.lastView, region.lastView, region.begin});
+            if (region.end > previous.end) previous.direct = nullptr;
             previous.atomic = previous.atomic || region.atomic;
+            previous.swept = previous.swept || region.swept;
+            previous.sparseHeap = previous.sparseHeap || region.sparseHeap;
             // A range starting before the mirror (only possible after the swap) keeps its prefix; the
             // earlier merged region ends at or before it, so the merged list stays sorted.
             previous.begin = std::min(previous.begin, region.begin);
@@ -1988,6 +2725,11 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         const bool stale = importsStale(context, state);
         for (auto& region : regions) {
             if (region.mirror != nullptr) continue;
+            if (sparseHeapCandidate(region)) {
+                region.direct = nullptr;
+                region.pending = true;
+                continue;
+            }
             // An import found when the lease was acquired is reused while none was dropped since.
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
@@ -2008,7 +2750,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             // device-local buffer that the CPU fallback replaces (none without a recorder to
             // record the copies: UploadFinish then binds the region in place).
             bool staged = Recorder::Active() != nullptr && stagingEligible(region, addressable);
-            const bool misaligned = (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment != 0;
+            const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
                 region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
@@ -2044,7 +2786,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     // GuestMemory::Read stores pending GPU results first (the flush hook locks for itself).
     for (auto& region : regions) {
         if (region.pending || region.mirror != nullptr || region.direct != nullptr) continue;
-        if (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+        if (sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)))) {
             region.pending = true;
             continue;
         }
@@ -2122,6 +2864,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (profile) refreshUs += microsecondsSince(refreshStart);
             continue;
         }
+        if (sparseHeapCandidate(region)) {
+            const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool bound = bindSparseMirror(region, importRanges());
+            if (profile) refreshUs += microsecondsSince(refreshStart);
+            if (bound) continue;
+        }
         bool copyOnGpu = false;
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
@@ -2137,12 +2885,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, range->address, range->bytes, importRanges());
+                if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
-            if (entry != nullptr && !staged && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
+            if (entry != nullptr && !staged && bindableInPlace(region.begin - entry->base, addressable)) {
                 region.direct = entry;
                 region.snapshot.clear();
                 // A buffer UploadPrepare made for a GPU copy is not needed: the import serves the
@@ -2258,8 +3006,17 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         }
     }
     const auto allocateStart = std::chrono::steady_clock::now();
+    if (region.sparse && region.buffer == nullptr && (region.hostBacked || region.writable)) {
+        const auto backedEnd = region.backed.empty() ? region.begin : region.backed.back().second;
+        const auto viewEnd = std::max(region.lastView, region.begin) + 4u;
+        constexpr std::uint64_t granule = 256;
+        const auto extent = std::max(backedEnd, viewEnd) - region.begin;
+        const auto end = region.begin + std::min<std::uint64_t>((extent + granule - 1) / granule * granule, bytes);
+        region.bufferEnd = end < region.end ? end : 0;
+    }
+    const auto allocated = region.bufferEnd != 0 ? region.bufferEnd - region.begin : bytes;
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
-    if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage);
+    if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
     // Named for the [hooksync] attribution: the reads below go through the flush hook.
@@ -2273,11 +3030,18 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
             if (written) region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
         } else {
             // `uploaded` holds the backed pieces back to back.
+            const auto target = region.buffer->Bytes().first(static_cast<std::size_t>(allocated));
+            const bool zeroGaps = region.bufferEnd != 0;
+            std::size_t cursor = 0;
             for (const auto& [first, last] : region.backed) {
-                const auto piece = region.buffer->Bytes().subspan(static_cast<std::size_t>(first - region.begin), static_cast<std::size_t>(last - first));
+                const auto at = static_cast<std::size_t>(first - region.begin);
+                if (zeroGaps && at > cursor) std::memset(target.data() + cursor, 0, at - cursor);
+                const auto piece = target.subspan(at, static_cast<std::size_t>(last - first));
                 GuestMemory::Read(first, piece);
                 if (written) region.uploaded.insert(region.uploaded.end(), piece.begin(), piece.end());
+                cursor = at + piece.size();
             }
+            if (zeroGaps && cursor < target.size()) std::memset(target.data() + cursor, 0, target.size() - cursor);
         }
     }
     else std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
@@ -2456,15 +3220,32 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     const auto* found = owner(address);
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
-    Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr), "guest buffer view exceeds its GPU owner");
+    const auto describe = [&](const char* what) {
+        char text[256];
+        std::snprintf(text, sizeof(text), "guest buffer view 0x%llx+0x%llx %s its GPU owner 0x%llx-0x%llx (buffer %d, direct %d, mirror %d)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), what, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.buffer != nullptr, region.direct != nullptr, region.mirror != nullptr);
+        return std::string(text);
+    };
+    if (!(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr))) Require(false, describe("exceeds"));
     const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
-    adjustment = static_cast<std::uint32_t>(offset % context.limits.minStorageBufferOffsetAlignment);
-    Require(adjustment % 4 == 0, "guest buffer view off the storage buffer offset alignment is not DWORD aligned");
-    Require(bytes + adjustment <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
+    Require(base % 4 == 0, "a guest buffer view in a GPU owner that does not start at a DWORD boundary is not implemented");
+    adjustment = static_cast<std::uint32_t>(offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
+    auto range = ViewBytes(bytes, adjustment);
+    const auto end = region.direct != nullptr ? region.direct->base + region.direct->bytes : servedEnd(region);
+    const bool cut = region.direct == nullptr && end < region.end;
+    if (cut) {
+        Require(address - adjustment < end, "guest buffer view starts past its copy");
+        range = std::min<std::uint64_t>(range, end - (address - adjustment));
+    }
+    if (address - adjustment + range > end) Require(false, describe("rounded up to its view range exceeds"));
+    Require(range <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
     const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
-    return {handle, offset - adjustment, bytes + adjustment};
+    return {handle, offset - adjustment, range};
+}
+
+std::uint64_t GuestBufferMemory::ViewBytes(std::uint64_t bytes, std::uint32_t adjustment) {
+    return adjustment % 4 == 0 ? bytes + adjustment : 4 * (adjustment / 4 + bytes / 4 + 1);
 }
 
 ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& region) {
@@ -2472,7 +3253,12 @@ ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& re
     const auto address = region.direct != nullptr ? region.direct->address + (region.begin - region.direct->base) : region.mirror != nullptr ? region.mirror->buffer->DeviceAddress() + (region.begin - region.mirror->base) : region.buffer->DeviceAddress();
     Require(region.end - region.begin <= std::numeric_limits<std::uint64_t>::max() - address, "GPU address range overflow");
     const auto permissions = ShaderRecompiler::BdaAbi::Read | (region.direct != nullptr && region.writable ? ShaderRecompiler::BdaAbi::Write : 0u);
-    return {region.begin, region.end, address, permissions, 0};
+    return {region.begin, region.direct != nullptr ? region.end : servedEnd(region), address, permissions, 0};
+}
+
+std::uint64_t GuestBufferMemory::servedEnd(const Region& region) {
+    if (region.mirror != nullptr) return std::min(region.end, region.mirror->base + region.mirror->bytes);
+    return region.bufferEnd != 0 ? region.bufferEnd : region.end;
 }
 
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
@@ -2480,19 +3266,70 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
     result.reserve(regions.size() + (space != nullptr ? space->ranges.size() : 0));
     for (const auto& region : regions) result.push_back(addressRange(region));
-    if (space == nullptr) return result;
-    // The table is searched by address (the recompiler's lookup bisects it): both lists are sorted
-    // and disjoint, so a merge keeps it so.
+    if (space != nullptr) {
+        std::vector<ShaderRecompiler::BdaAbi::Range> combined;
+        combined.reserve(result.size() + space->ranges.size());
+        std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        result = std::move(combined);
+    }
+    if (writes.empty()) return result;
+    auto sortedWrites = writes;
+    std::sort(sortedWrites.begin(), sortedWrites.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    for (const auto& interval : sortedWrites) {
+        if (!intervals.empty() && interval.first <= intervals.back().second) intervals.back().second = std::max(intervals.back().second, interval.second);
+        else intervals.push_back(interval);
+    }
     std::vector<ShaderRecompiler::BdaAbi::Range> merged;
-    merged.reserve(result.size() + space->ranges.size());
-    std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(merged), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    merged.reserve(result.size() + intervals.size() * 2u);
+    std::size_t firstWrite = 0;
+    for (const auto& range : result) {
+        if ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u) {
+            merged.push_back(range);
+            continue;
+        }
+        while (firstWrite < intervals.size() && intervals[firstWrite].second <= range.begin) ++firstWrite;
+        auto cursor = range.begin;
+        const auto append = [&](std::uint64_t end, bool written) {
+            if (cursor == end) return;
+            auto part = range;
+            part.begin = cursor;
+            part.end = end;
+            part.deviceAddress += cursor - range.begin;
+            if (written) {
+                const auto* region = owner(cursor);
+                Require(region != nullptr && region->writable && (region->mirror == nullptr || region->mirror->writable), "runtime buffer write has no writable GPU owner");
+                part.permissions |= ShaderRecompiler::BdaAbi::Write;
+            }
+            merged.push_back(part);
+            cursor = end;
+        };
+        for (auto index = firstWrite; index < intervals.size() && intervals[index].first < range.end; ++index) {
+            append(std::max(cursor, intervals[index].first), false);
+            append(std::min(range.end, intervals[index].second), true);
+        }
+        append(range.end, false);
+    }
     return merged;
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr || !regions.empty()) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
-    return CachedTable{space->serial, &space->ranges};
+    if (writes.empty()) return CachedTable{space->serial, &space->ranges};
+    if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
+    std::lock_guard lock(space->tableMutex);
+    const auto found = space->writeTables.find(writes);
+    if (found != space->writeTables.end()) {
+        writeTableSerial = found->second.first;
+        writeTableRanges = found->second.second;
+    } else {
+        writeTableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+        writeTableSerial = Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (space->writeTables.size() >= 64u) space->writeTables.erase(space->writeTables.begin());
+        space->writeTables.emplace(writes, std::pair{writeTableSerial, writeTableRanges});
+    }
+    return CachedTable{writeTableSerial, writeTableRanges.get()};
 }
 
 bool GuestBufferMemory::HasCopiedWrites() const {
@@ -2548,6 +3385,25 @@ void storeChanged(std::uint64_t address, std::span<const std::byte> current, std
     if (cursor < address + current.size()) unchanged(cursor, address + current.size());
 }
 
+void storeSparse(ImageMirror& mirror, std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    constexpr std::uint64_t block = 65536;
+    const auto end = address + current.size();
+    const auto forget = [&](std::uint64_t from, std::uint64_t to) {
+        const auto at = static_cast<std::size_t>(from - address);
+        if (from >= to || std::memcmp(current.data() + at, original.data() + at, static_cast<std::size_t>(to - from)) == 0) return;
+        for (auto index = from / block - mirror.base / block; index <= (to - 1) / block - mirror.base / block; ++index) mirror.generations[static_cast<std::size_t>(index)] = 0;
+    };
+    auto cursor = address;
+    for (const auto& [first, last] : GuestMemory::DescribeCommitted(address, current.size(), true).ranges) {
+        forget(cursor, first);
+        const auto at = static_cast<std::size_t>(first - address);
+        const auto length = static_cast<std::size_t>(last - first);
+        GuestMemory::WriteChanged(first, current.subspan(at, length), original.subspan(at, length));
+        cursor = last;
+    }
+    forget(cursor, end);
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>> writes) {
     std::sort(writes.begin(), writes.end());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
@@ -2567,7 +3423,9 @@ void GuestBufferMemory::takeHeapReferences() {
         if (found == nullptr || found->mirror == nullptr || !found->mirror->heap || !found->mirror->writable) continue;
         Require(end <= found->end, "written range exceeds its heap mirror");
         const auto& mirror = *found->mirror;
-        const auto bytes = mirror.buffer->Bytes().subspan(static_cast<std::size_t>(begin - mirror.base), static_cast<std::size_t>(end - begin));
+        const auto served = std::min(end, servedEnd(*found));
+        if (begin >= served) continue;
+        const auto bytes = mirror.buffer->Bytes().subspan(static_cast<std::size_t>(begin - mirror.base), static_cast<std::size_t>(served - begin));
         heapReferences.emplace_back(begin, std::vector<std::byte>(bytes.begin(), bytes.end()));
     }
 }
@@ -2595,12 +3453,15 @@ void GuestBufferMemory::WriteBack() {
             // refresh does not mistake the GPU's results for a guest change.
             auto& mirror = *region.mirror;
             const auto offset = static_cast<std::size_t>(begin - mirror.base);
-            const auto length = static_cast<std::size_t>(end - begin);
+            const auto served = std::min(end, servedEnd(region));
+            if (mirror.heap && begin >= served) continue;
+            const auto length = static_cast<std::size_t>((mirror.heap ? served : end) - begin);
             const auto current = mirror.buffer->Bytes().subspan(offset, length);
             if (mirror.heap) {
                 const auto reference = std::find_if(heapReferences.begin(), heapReferences.end(), [&](const auto& entry) { return entry.first == begin; });
                 Require(reference != heapReferences.end() && reference->second.size() == length, "heap mirror write-back has no reference");
-                storeChanged(begin, current, reference->second);
+                if (mirror.sparse) storeSparse(mirror, begin, current, reference->second);
+                else storeChanged(begin, current, reference->second);
                 continue;
             }
             GuestMemory::WriteChanged(begin, current, std::span<const std::byte>(mirror.shadow).subspan(offset, length));
@@ -2695,6 +3556,20 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     }
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+    }
+    return result;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    if (!uploaded || committed) return result;
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
     }
     return result;
 }

@@ -57,6 +57,28 @@ def main():
         result, output = run_case(relinker, work, "syscall-filter", ["unused-filter=1"], b"\x0f\x05\xc3")
         assert result.returncode == 2 and "Forbidden syscall instruction" in result.stderr and not output.exists(), result
 
+        forbidden = (
+            ("rex-syscall", b"\x48\x0f\x05"),
+            ("operand-syscall", b"\x66\x0f\x05"),
+            ("address-sysenter", b"\x67\x0f\x34"),
+            ("segment-sysenter", b"\x2e\x0f\x34"),
+            ("rex-sysret", b"\x48\x0f\x07"),
+            ("mixed-sysret", b"\x66\x67\x48\x0f\x07"),
+            ("operand-int80", b"\x66\xcd\x80"),
+            ("segment-int80", b"\x64\xcd\x80"),
+        )
+        for name, instruction in forbidden:
+            result, output = run_case(relinker, work, name, [], b"\x90" + instruction + b"\xc3")
+            assert result.returncode == 2 and not output.exists(), (name, result.stdout, result.stderr)
+            assert "Forbidden syscall instruction at code offset 0x1801" in result.stderr, (name, result.stderr)
+
+        result, output = run_case(relinker, work, "immediate-decoys", [],
+                                  b"\x48\xb8\x0f\x05\xcd\x80\x0f\x34\x0f\x07\xc3")
+        assert result.returncode == 0 and output.exists(), (result.stdout, result.stderr)
+
+        result, output = run_case(relinker, work, "skip-prefixed", ["--skip-syscall-check"], b"\x48\x0f\x05\xc3")
+        assert result.returncode == 0 and output.exists(), (result.stdout, result.stderr)
+
         result, output = run_case(relinker, work, "skip", ["--skip-syscall-check"], b"\x0f\x05\xc3")
         assert result.returncode == 0 and output.exists(), (result.stdout, result.stderr)
         second_code = b"\x90" * 16 + b"\xb8\x2a\x00\x00\x00\xc3"
@@ -77,6 +99,16 @@ def main():
 
         result, output = run_case(relinker, work, "strict", ["unused-filter=2"], b"\x90\xc3")
         assert result.returncode == 2 and "multiple executable segments" in result.stderr and not output.exists(), result
+
+        for name, memory_size in (("overlap-past-end", 0x10000000000000), ("overlap-next", 0x1300)):
+            image = fixture(b"\x90\xc3")
+            struct.pack_into("<Q", image, 64 + 40, memory_size)
+            source = work / (name + ".elf")
+            output = work / (name + ".exe")
+            source.write_bytes(image)
+            result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+                                    capture_output=True, text=True, timeout=20)
+            assert result.returncode == 2 and "Overlapping PT_LOAD memory ranges" in result.stderr and not output.exists(), (name, result)
     print("Executable segment tests passed")
 
 

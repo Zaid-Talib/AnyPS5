@@ -31,11 +31,13 @@ void TranslationContext::sSaveexec(const RdnaInstruction& inst, IrOpcode operati
     else if (operation == IrOpcode::LogicalOr) operation = IrOpcode::BitwiseOr32;
     else if (operation == IrOpcode::LogicalXor) operation = IrOpcode::BitwiseXor32;
     const bool writeFirst = SaveexecWritesDestinationFirst() && !writeResult;
+    const bool execSource = sourceAt(inst, 0u).kind == RdnaOperandKind::ExecLo;
     if (write64) {
         const std::array<IrU32, 2> oldExec{IrU32(ir.GetExecLo()), IrU32(ir.GetExecHi())};
-        if (writeFirst) writeU32Pair(inst.destination, oldExec);
-        const std::array<IrU32, 2> source = readU32Pair(sourceAt(inst, 0u));
-        if (!writeFirst && !writeResult) writeU32Pair(inst.destination, oldExec);
+        const std::array<IrU32, 2> savedExec{hostExecWord(0u), hostExecWord(1u)};
+        if (writeFirst) writeU32Pair(inst.destination, savedExec);
+        const std::array<IrU32, 2> source = execSource ? oldExec : readU32Pair(sourceAt(inst, 0u));
+        if (!writeFirst && !writeResult) writeU32Pair(inst.destination, savedExec);
         IrValue& lowExecOperand = negateExec ? ir.BitwiseNot(oldExec[0].Value()) : oldExec[0].Value();
         IrValue& lowSourceOperand = negateSource ? ir.BitwiseNot(source[0].Value()) : source[0].Value();
         IrValue& highExecOperand = negateExec ? ir.BitwiseNot(oldExec[1].Value()) : oldExec[1].Value();
@@ -46,22 +48,23 @@ void TranslationContext::sSaveexec(const RdnaInstruction& inst, IrOpcode operati
         const IrU32 newExecHi(negateResult ? ir.BitwiseNot(highCombined) : highCombined);
         ir.SetExecLo(newExecLo.Value());
         ir.SetExecHi(newExecHi.Value());
-        if (writeResult) writeU32Pair(inst.destination, {newExecLo, newExecHi});
+        if (writeResult) writeU32Pair(inst.destination, {hostExecWord(0u), hostExecWord(1u)});
         const IrU1 nonZero(ir.LogicalOr(ir.INotEqual(newExecLo.Value(), ir.Constant(0u)), ir.INotEqual(newExecHi.Value(), ir.Constant(0u))));
         ir.SetScc(nonZero.Value());
         ir.SetExec(threadBit({newExecLo, newExecHi}).Value());
         return;
     }
     const IrU32 oldExec(ir.GetExecLo());
-    if (writeFirst) writeRawU32(inst.destination, oldExec);
-    const IrU32 source = readU32(sourceAt(inst, 0u));
-    if (!writeFirst && !writeResult) writeRawU32(inst.destination, oldExec);
+    const IrU32 savedExec = hostExecWord(0u);
+    if (writeFirst) writeRawU32(inst.destination, savedExec);
+    const IrU32 source = execSource ? oldExec : readU32(sourceAt(inst, 0u));
+    if (!writeFirst && !writeResult) writeRawU32(inst.destination, savedExec);
     IrValue& execOperand = negateExec ? ir.BitwiseNot(oldExec.Value()) : oldExec.Value();
     IrValue& sourceOperand = negateSource ? ir.BitwiseNot(source.Value()) : source.Value();
     IrValue& combined = ir.Emit(operation, IrType::U32, {&execOperand, &sourceOperand});
     const IrU32 newExec(negateResult ? ir.BitwiseNot(combined) : combined);
     ir.SetExecLo(newExec.Value());
-    if (writeResult) writeRawU32(inst.destination, newExec);
+    if (writeResult) writeRawU32(inst.destination, hostExecWord(0u));
     const IrU1 nonZero(ir.INotEqual(newExec.Value(), ir.Constant(0u)));
     ir.SetScc(nonZero.Value());
     ir.SetExec(threadBit({newExec, IrU32(ir.GetExecHi())}).Value());
@@ -219,6 +222,12 @@ void TranslationContext::sGetpcB64(const RdnaInstruction& inst) {
     writeU32Pair(inst.destination, extractU64(pc));
 }
 
+void TranslationContext::sSwappcB64(const RdnaInstruction& inst) {
+    IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
+    const IrU64 link(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
+    writeU32Pair(inst.destination, extractU64(link));
+}
+
 void TranslationContext::sCselectB32(const RdnaInstruction& inst) {
     const IrU32 trueValue = readU32(sourceAt(inst, 0u));
     const IrU32 falseValue = readU32(sourceAt(inst, 1u));
@@ -233,6 +242,21 @@ void TranslationContext::scalarSelect64(const RdnaInstruction& inst, const RdnaO
     const IrU32 low(ir.Select(condition, trueValue[0].Value(), falseValue[0].Value()));
     const IrU32 high(ir.Select(condition, trueValue[1].Value(), falseValue[1].Value()));
     writeU32Pair(inst.destination, {low, high});
+}
+
+void TranslationContext::scalarSelectMask64(const RdnaInstruction& inst) {
+    if (inst.destination.kind != RdnaOperandKind::ScalarRegister) {
+        scalarSelect64(inst, sourceAt(inst, 1u));
+        return;
+    }
+    const RdnaOperand& trueSource = sourceAt(inst, 0u);
+    const RdnaOperand& falseSource = sourceAt(inst, 1u);
+    IrValue& valid = ir.LogicalAnd(readMaskValid(trueSource).Value(), readMaskValid(falseSource).Value());
+    IrValue& bit = ir.Emit(IrOpcode::SelectU1, IrType::U1, {&ir.GetScc(), &readMask(trueSource).Value(), &readMask(falseSource).Value()});
+    scalarSelect64(inst, falseSource);
+    const auto dst = static_cast<ScalarReg>(inst.destination.reg);
+    ir.SetThreadBitScalarReg(dst, bit);
+    ir.SetScalarMaskTag(dst, valid);
 }
 
 void TranslationContext::movB32(const RdnaInstruction& inst, bool applyFloatModifiers) {

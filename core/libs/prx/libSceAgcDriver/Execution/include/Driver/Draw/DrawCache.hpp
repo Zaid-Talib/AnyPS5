@@ -32,6 +32,15 @@ struct DrawDecode {
     std::vector<ShaderRecompiler::ProgramRole> roles;
 };
 
+void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const ShaderRegistry& registry, bool staticAbi, bool includeFragment);
+
+struct PreparedGraphicsStage {
+    std::shared_ptr<const ShaderSnapshot> snapshot;
+    PreparedShaders::Entry entry;
+};
+
+std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target);
+
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::shared_ptr<const DrawRecipe> recipe;
@@ -71,6 +80,8 @@ struct StageCapture {
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
 };
+
+bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 
 }
 

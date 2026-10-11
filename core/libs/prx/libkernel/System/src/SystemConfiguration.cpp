@@ -1,6 +1,13 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <random>
+#include <stdexcept>
+#include <string>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -9,6 +16,31 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+
+struct SceKernelSystemSwVersion {
+    std::uint64_t size;
+    char versionString[0x1C];
+    std::uint32_t version;
+};
+
+namespace {
+
+int CopyOut(const void* value, std::size_t size, void* oldValue, std::size_t* oldLength) {
+    if (oldValue == nullptr) {
+        if (oldLength != nullptr) *oldLength = size;
+        return 0;
+    }
+    const std::size_t copied = std::min(oldLength != nullptr ? *oldLength : 0, size);
+    std::memcpy(oldValue, value, copied);
+    if (oldLength != nullptr) *oldLength = copied;
+    if (copied < size) {
+        *__error_nid_postfix() = 12;
+        return -1;
+    }
+    return 0;
+}
+
+}
 
 extern "C" {
 // Guest long is 64 bits, including when the Windows host long is 32 bits.
@@ -47,5 +79,63 @@ std::int64_t APS5_VABI sysconf_nid_postfix(int name) {
     if (result <= 0) { *__error_nid_postfix() = 5; return -1; }
     *__error_nid_postfix() = saved;
     return result;
+}
+int APS5_VABI sysctl_nid_postfix(const int* name, std::uint32_t nameLength, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
+    (void)newLength;
+    if (nameLength < 2 || nameLength > 24) {
+        *__error_nid_postfix() = 22;
+        return -1;
+    }
+    if (name == nullptr) {
+        *__error_nid_postfix() = 14;
+        return -1;
+    }
+    if (nameLength != 2 || name[0] != 6 || name[1] != 3) {
+        std::string mib;
+        for (std::uint32_t i = 0; i < nameLength; ++i) mib += (i == 0 ? "" : ".") + std::to_string(name[i]);
+        throw std::runtime_error(std::string(__func__) + ": unsupported MIB " + mib);
+    }
+    if (newValue != nullptr) {
+        *__error_nid_postfix() = 1;
+        return -1;
+    }
+    const std::int64_t processors = sysconf_nid_postfix(58);
+    if (processors <= 0) return -1;
+    const int value = static_cast<int>(processors);
+    return CopyOut(&value, sizeof(value), oldValue, oldLength);
+}
+
+int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
+    if (name == nullptr) {
+        *__error_nid_postfix() = 14;
+        return -1;
+    }
+    if (std::strcmp(name, "kern.rng_pseudo") == 0) {
+        if (newValue != nullptr) {
+            *__error_nid_postfix() = 1;
+            return -1;
+        }
+        if (oldValue == nullptr || oldLength == nullptr) throw std::runtime_error(std::string(__func__) + ": kern.rng_pseudo without an output buffer");
+        static std::random_device device;
+        auto* bytes = static_cast<std::uint8_t*>(oldValue);
+        for (std::size_t i = 0; i < *oldLength; ++i) bytes[i] = static_cast<std::uint8_t>(device());
+        return 0;
+    }
+    if (std::strcmp(name, "hw.ncpu") != 0) throw std::runtime_error(std::string(__func__) + ": unsupported name " + name);
+    static constexpr int mib[] = {6, 3};
+    return sysctl_nid_postfix(mib, 2, oldValue, oldLength, newValue, newLength);
+}
+
+int APS5_VABI sceKernelGetSystemSwVersion_nid_postfix(SceKernelSystemSwVersion* version) {
+    if (version == nullptr) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if (version->size != sizeof(SceKernelSystemSwVersion)) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    std::memset(version->versionString, 0, sizeof(version->versionString));
+    std::memcpy(version->versionString, "01.000.000", sizeof("01.000.000"));
+    version->version = 0x01000000;
+    return 0;
 }
 }

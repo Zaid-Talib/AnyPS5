@@ -11,12 +11,12 @@
 namespace ShaderRecompiler
 {
 
-void EmitModuleHeader(SpirvModule& module, const IrProgram& program, const BindingAllocationResult& bindings) {
+void EmitModuleHeader(SpirvModule& module, const IrProgram& program, const CompiledBindingLayout& bindings) {
     CheckBindings(program, bindings);
     EmitBaseHeader(module, program);
 }
 
-void EmitModuleHeader(SpirvEmitterState& state, const BindingAllocationResult& bindings) {
+void EmitModuleHeader(SpirvEmitterState& state, const CompiledBindingLayout& bindings) {
     CheckBindings(state.program, bindings);
     DefineModule(state);
 }
@@ -77,6 +77,9 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitExtension(extension);
     }
     if (state.requirements.bufferInt64Atomics) {
+        if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) == state.supportedCapabilities.end()) {
+            FailEmit("64-bit buffer atomics need shaderBufferInt64Atomics");
+        }
         state.module.EmitCapability(spv::CapabilityInt64);
         state.module.EmitCapability(spv::CapabilityInt64Atomics);
     }
@@ -131,7 +134,7 @@ void DefineModule(SpirvEmitterState& state) {
     const bool fragmentBarycentric = StageOf(state) == IrShaderStage::Pixel && std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
         return input.perVertex || input.kind == StageInputKind::BaryCoordSmooth || input.kind == StageInputKind::BaryCoordNoPerspective;
     });
-    if (fragmentBarycentric) {
+    if (fragmentBarycentric && !state.program.Metadata().barycentricEmulation) {
         state.module.EmitCapability(spv::CapabilityFragmentBarycentricKHR);
         state.module.EmitExtension("SPV_KHR_fragment_shader_barycentric");
     }
@@ -144,6 +147,10 @@ void DefineModule(SpirvEmitterState& state) {
         }
         state.module.EmitCapability(spv::CapabilityFloat64);
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSignedZeroInfNanPreserve, 64u);
+        if (state.float64DenormPreserve) {
+            state.module.EmitCapability(spv::CapabilityDenormPreserve);
+            state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 64u);
+        }
     }
     if (const auto* workgroup = ShaderWorkgroupInput(state)) {
         const std::uint32_t derivativeDefault = state.requirements.computeDerivatives ? 2u : 1u;
@@ -173,8 +180,16 @@ void DefineModule(SpirvEmitterState& state) {
                 state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthGreater);
             }
         }
-        if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable) {
+        if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable && !pixel.psAlphaToCoverage) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeEarlyFragmentTests);
+        }
+        if (pixel.psOrderedPixelShader) {
+            if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFragmentShaderPixelInterlockEXT)) == state.supportedCapabilities.end()) {
+                throw std::runtime_error("a primitive-ordered pixel shader needs the fragmentShaderPixelInterlock feature, which the device lacks");
+            }
+            state.module.EmitCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
+            state.module.EmitExtension("SPV_EXT_fragment_shader_interlock");
+            state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModePixelInterlockOrderedEXT);
         }
     }
     if (state.requirements.computeDerivatives && StageOf(state) == IrShaderStage::Compute) {

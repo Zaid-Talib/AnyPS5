@@ -1,4 +1,6 @@
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libkernel/Module/ModuleArgs.hpp"
 #include <nid/NidCompute.hpp>
 #include <array>
 #include <filesystem>
@@ -7,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <set>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -15,6 +18,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <link.h>
 #endif
 
 namespace {
@@ -49,6 +53,39 @@ void* Symbol(Module& module, const char* name) {
     return ::dlsym(module.native, name);
 #endif
 }
+#ifndef _WIN32
+std::uintptr_t MainProgramBase() {
+    static const std::uintptr_t base = [] {
+        struct Scan {
+            std::uintptr_t value = 0;
+        };
+        Scan scan;
+        ::dl_iterate_phdr(
+            [](dl_phdr_info* info, size_t, void* data) {
+                auto* found = static_cast<Scan*>(data);
+                if (found->value == 0 && info->dlpi_name != nullptr && info->dlpi_name[0] == '\0') found->value = info->dlpi_addr;
+                return found->value == 0 ? 0 : 1;
+            },
+            &scan);
+        return scan.value;
+    }();
+    return base;
+}
+
+bool FromGuestModule(void* address) {
+    Dl_info info{};
+    if (address == nullptr || !::dladdr(address, &info) || info.dli_fname == nullptr) return false;
+    if (reinterpret_cast<std::uintptr_t>(info.dli_fbase) == MainProgramBase()) return true;
+    const std::string path(info.dli_fname);
+    return path.ends_with(".prx");
+}
+
+void* DefaultScopeSymbol(const char* symbolName) {
+    auto* result = ::dlsym(RTLD_DEFAULT, symbolName);
+    return FromGuestModule(result) ? result : nullptr;
+}
+#endif
+
 void* FindSymbol(Module& module, const char* name) {
     if (auto* symbol = Symbol(module, name)) return symbol;
     const auto nid = Nid::ComputeNid(name, "");
@@ -69,6 +106,28 @@ char* APS5_VABI dlerror_nid_postfix() {
     pendingError = false;
     return loaderError.data();
 }
+#ifdef _WIN32
+static void InitializeDeferredModule(HMODULE native) {
+    using Entry = int (APS5_VABI *)(std::size_t, const void*, void*);
+    using Initializer = void (APS5_VABI *)(int, char**, char**);
+    static std::mutex initializedLock;
+    static std::set<HMODULE> initialized;
+    const auto* table = reinterpret_cast<const std::uint32_t*>(GetProcAddress(native, "__aps5_guest_initialize"));
+    if (!table) return;
+    {
+        std::lock_guard lock(initializedLock);
+        if (!initialized.insert(native).second) return;
+    }
+    auto* base = reinterpret_cast<std::uint8_t*>(native);
+    const auto* pending = static_cast<const PendingModuleArgs*>(__aps5_get_pending_module_args_nid_no_patch());
+    if (table[0] != 0) __aps5_set_module_init_result_nid_no_patch(reinterpret_cast<Entry>(base + table[0])(pending->args, pending->argp, nullptr));
+    for (std::uint32_t index = 0; index < table[1]; ++index) {
+        const auto initializer = *reinterpret_cast<Initializer*>(base + table[2 + index]);
+        if (initializer) initializer(0, nullptr, nullptr);
+    }
+}
+#endif
+
 static std::filesystem::path RelinkedModulePath(const std::filesystem::path& path) {
     auto relinked = path;
     relinked += ".guest.prx";
@@ -91,6 +150,7 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
             if (!*path) { Error("dlopen: empty module path"); return nullptr; }
             const auto resolved = RelinkedModulePath(ResolvePath_nid_no_patch(path));
             module->native = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (module->native) InitializeDeferredModule(static_cast<HMODULE>(module->native));
         }
         if (!module->native) {
             char message[128];
@@ -116,7 +176,7 @@ void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
         std::vector<std::shared_ptr<Module>> search;
         {
             std::lock_guard lock(modulesMutex);
-            if (handle == reinterpret_cast<void*>(static_cast<std::intptr_t>(-2))) {
+            if (handle == nullptr || handle == reinterpret_cast<void*>(static_cast<std::intptr_t>(-2))) {
                 for (const auto& [key, module] : modules) if (module->global) search.push_back(module);
             } else {
                 auto found = modules.find(reinterpret_cast<std::uintptr_t>(handle));
@@ -125,17 +185,44 @@ void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
             }
         }
         for (const auto& module : search) if (auto* result = FindSymbol(*module, name)) return result;
+#ifndef _WIN32
+        if (handle == nullptr || handle == reinterpret_cast<void*>(static_cast<std::intptr_t>(-2))) {
+            if (auto* result = DefaultScopeSymbol(name)) return result;
+            const auto nid = Nid::ComputeNid(name, "");
+            if (auto* result = DefaultScopeSymbol(nid.c_str())) return result;
+        }
+#endif
         Error("dlsym: symbol not found in supported module scope");
         return nullptr;
     } catch (const std::exception& error) { Error(error.what()); return nullptr; }
 }
 int APS5_VABI dlclose_nid_postfix(void* handle) {
+    const auto key = reinterpret_cast<std::uintptr_t>(handle);
     std::shared_ptr<Module> module;
+#ifdef _WIN32
+    bool lastReference = true;
+#endif
     {
         std::lock_guard lock(modulesMutex);
-        auto found = modules.find(reinterpret_cast<std::uintptr_t>(handle));
+        auto found = modules.find(key);
         if (found == modules.end()) { Error("dlclose: invalid module handle"); return -1; }
-        module = std::move(found->second);
+        module = found->second;
+#ifdef _WIN32
+        for (const auto& [other, entry] : modules) {
+            if (other != key && entry->native == module->native) lastReference = false;
+        }
+#endif
+    }
+#ifdef _WIN32
+    if (module->owned && module->native && lastReference) {
+        GuestAllocations::Mutation mutation;
+        mutation.UnregisterImage(module->native);
+    }
+#endif
+    {
+        std::lock_guard lock(modulesMutex);
+        auto found = modules.find(key);
+        if (found == modules.end()) { Error("dlclose: invalid module handle"); return -1; }
         modules.erase(found);
     }
     // Unload outside the registry lock: module destructors may call loader APIs.

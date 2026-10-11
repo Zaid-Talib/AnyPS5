@@ -53,7 +53,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
 
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
-    const auto baseAddress = base40 << 8u;
+    auto baseAddress = base40 << 8u;
     Require(baseAddress != 0, "guest texture descriptor has a null base address");
 
     const auto minLod = (words[1] >> 8u) & 0xfffu;
@@ -71,7 +71,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     const auto bcSwizzle = (words[3] >> 25u) & 0x7u;
     const auto typeRaw = (words[3] >> 28u) & 0xfu;
 
-    const auto depth = (words[4] >> 0u) & 0x1fffu;
+    auto depth = (words[4] >> 0u) & 0x1fffu;
     const auto baseArray = (words[4] >> 16u) & 0x1fffu;
 
     const auto arrayPitch = (words[5] >> 0u) & 0xfu;
@@ -115,7 +115,6 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     static_cast<void>(maxCompBlkSize);
     // Surfaces are always written uncompressed here (render targets and storage images bypass DCC), so
     // only the fast-clear keys in DCC metadata change what a read returns (see DccMetadata.hpp).
-    static_cast<void>(metaPipeAligned);
     static_cast<void>(writeCompress);
     if (dccColorTransf) {
         static bool reported = false;
@@ -124,7 +123,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             std::fprintf(stderr, "[gpu] texture DCC color transform is ignored (word6=0x%08x word7=0x%08x)\n", words[6], words[7]);
         }
     }
-    Require(bcSwizzle == 0, "guest texture descriptor uses a BC swizzle which is not implemented");
+    Require(bcSwizzle <= 5u, "guest texture descriptor uses a reserved BC swizzle");
 
     Require(baseLevel <= lastLevel, "guest texture descriptor has a base mip level past its last mip level");
 
@@ -141,8 +140,12 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     // Views may name levels past MAX_MIP (a 512x512 view through 1x1 over a 9-level surface); the
     // hardware never addresses them, so the view ends at the surface's last level.
     if (baseLevel <= maxMip) lastLevel = std::min(lastLevel, maxMip);
-    // XOR swizzles fold a pipe/bank XOR into the low address bits; only unmodified 64 KiB bases are modeled.
-    Require(XorSwizzleMode(tileMode) == 0 || (baseAddress & (tileMode == TextureTileMode::kS4KBX || tileMode == TextureTileMode::kD4KBX ? 0xfffu : 0xffffu)) == 0, "guest texture descriptor combines an XOR swizzle with a pipe/bank XOR base which is not implemented");
+    std::uint32_t pipeBankXor = 0;
+    if (XorSwizzleMode(tileMode) != 0) {
+        pipeBankXor = static_cast<std::uint32_t>(baseAddress & (tileMode == TextureTileMode::kS4KBX || tileMode == TextureTileMode::kD4KBX ? 0xfffu : 0xffffu));
+        baseAddress -= pipeBankXor;
+        Require(baseAddress != 0, "guest texture descriptor has a null base address");
+    }
 
     switch (dimension) {
         case TextureDimension::k1D:
@@ -166,12 +169,17 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
         case TextureDimension::kCube:
             Require(width == height, "guest cube texture descriptor is not square");
             Require(baseArray <= depth, "guest cube texture descriptor has a base array past its last array slice");
-            Require((depth - baseArray + 1u) % 6u == 0, "guest cube texture descriptor does not contain a multiple of 6 array slices");
+            if (baseArray == depth) depth += 5u;
+            if ((depth - baseArray + 1u) % 6u != 0) {
+                Require(false, "guest cube texture descriptor does not contain a multiple of 6 array slices" +
+                    describe() + " (base array " + std::to_string(baseArray) + ")");
+            }
             break;
     }
 
     GuestTextureResource result{};
     result.baseAddress = baseAddress;
+    result.pipeBankXor = pipeBankXor;
     result.width = width;
     result.height = height;
     result.depthOrLastArray = depth;
@@ -187,8 +195,10 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.dstSelY = static_cast<std::uint8_t>(dstSelY);
     result.dstSelZ = static_cast<std::uint8_t>(dstSelZ);
     result.dstSelW = static_cast<std::uint8_t>(dstSelW);
+    result.bcSwizzle = static_cast<std::uint8_t>(bcSwizzle);
     result.dccAddress = metaCompress ? metaAddr << 8u : 0u;
     result.dccAlphaOnMsb = dccAlphaPos;
+    result.dccPipeAligned = metaPipeAligned;
     result.minLod = minLod;
     if (baseLevel > maxMip) {
         Require(LevelsFitAllocation(result, lastLevel + 1u), "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
@@ -200,6 +210,10 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
 float EffectiveMinLod(const GuestTextureResource& resource) {
     if (resource.minLod <= resource.baseLevel * 256u) return 0.0f;
     return std::min(static_cast<float>(resource.minLod) / 256.0f, static_cast<float>(resource.lastLevel));
+}
+
+bool DescriptorSingleLevel(std::span<const std::uint32_t> words) {
+    return ((words[3] >> 12u) & 0xfu) == ((words[3] >> 16u) & 0xfu);
 }
 
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension) {

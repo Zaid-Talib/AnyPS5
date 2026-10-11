@@ -12,8 +12,10 @@ int APS5_VABI sceVideoOutAddFlipEvent(KernelEqueue eq, int handle, void* udata);
 int APS5_VABI sceVideoOutAddOutputModeEvent(KernelEqueue eq, int handle, void* udata);
 int APS5_VABI sceVideoOutAddPreVblankStartEvent(KernelEqueue eq, int handle, void* udata);
 int APS5_VABI sceVideoOutAddVblankEvent(KernelEqueue eq, int handle, void* udata);
+int APS5_VABI sceVideoOutAddVrrActiveStatusEvent(KernelEqueue eq, int handle, void* udata);
 
 int APS5_VABI sceVideoOutDeleteFlipEvent(KernelEqueue eq, int handle);
+int APS5_VABI sceVideoOutDeleteOutputModeEvent(KernelEqueue eq, int handle);
 int APS5_VABI sceVideoOutDeletePreVblankStartEvent(KernelEqueue eq, int handle);
 int APS5_VABI sceVideoOutDeleteVblankEvent(KernelEqueue eq, int handle);
 

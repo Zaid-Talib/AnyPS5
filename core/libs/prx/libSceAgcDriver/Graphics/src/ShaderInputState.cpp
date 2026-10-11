@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,20 +39,14 @@ std::uint32_t read(const Registers& registers, std::uint32_t offset, RegisterBan
     return it->second;
 }
 
-std::uint32_t readOr(const Registers& registers, std::uint32_t offset, RegisterBank bank, std::uint32_t fallback) {
-    NoteRegisterRead(bank, offset);
-    const auto it = registers.find(offset);
-    return it == registers.end() ? fallback : it->second;
-}
-
-template <typename T> T _readHeaderPod(std::span<const std::byte> header, std::uint64_t headerAddress, const void* pointer) {
+template <typename T> T _readHeaderPod(std::span<const std::byte> header, std::uint64_t headerAddress, const void* pointer, std::size_t bytes = sizeof(T)) {
     if (pointer == nullptr) throw std::runtime_error("AGC graphics: null AGC header pointer");
     const auto address = reinterpret_cast<std::uint64_t>(pointer);
     if (address < headerAddress) throw std::runtime_error("AGC graphics: AGC header pointer precedes the shader header");
     const auto offset = address - headerAddress;
-    if (offset + sizeof(T) > header.size()) throw std::runtime_error("AGC graphics: AGC header pointer is outside the registered shader header");
-    T value;
-    std::memcpy(&value, header.data() + offset, sizeof(T));
+    if (offset > header.size() || bytes > header.size() - offset) throw std::runtime_error("AGC graphics: AGC header pointer is outside the registered shader header");
+    T value{};
+    std::memcpy(&value, header.data() + offset, bytes);
     return value;
 }
 
@@ -68,16 +63,21 @@ template <typename T> void _readHeaderArray(std::span<const std::byte> header, s
 
 }
 
-ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers& shader) {
-    const auto numThreadX = read(shader, computeNumThreadX, RegisterBank::Shader);
-    const auto numThreadY = read(shader, computeNumThreadY, RegisterBank::Shader);
-    const auto numThreadZ = read(shader, computeNumThreadZ, RegisterBank::Shader);
+ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers& shader, std::span<const std::byte> header) {
+    const auto numThreadX = read(shader, computeNumThreadX, RegisterBank::Shader) & 0xffffu;
+    const auto numThreadY = read(shader, computeNumThreadY, RegisterBank::Shader) & 0xffffu;
+    const auto numThreadZ = read(shader, computeNumThreadZ, RegisterBank::Shader) & 0xffffu;
     if (numThreadX == 0 || numThreadY == 0 || numThreadZ == 0) {
         throw std::runtime_error("AGC graphics: COMPUTE_NUM_THREAD_X/Y/Z must be nonzero");
     }
     const auto rsrc2 = read(shader, computePgmRsrc2, RegisterBank::Shader);
+    std::uint32_t scratchDwords = 0;
     if ((rsrc2 & 0x1u) != 0) {
-        throw std::runtime_error("AGC graphics: COMPUTE_PGM_RSRC2.SCRATCH_EN is unsupported");
+        if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: COMPUTE_PGM_RSRC2.SCRATCH_EN without an AGC shader header");
+        Shader agcShader;
+        std::memcpy(&agcShader, header.data(), sizeof(Shader));
+        scratchDwords = agcShader.scratch_size_dw_per_thread;
+        if (scratchDwords == 0) throw std::runtime_error("AGC graphics: COMPUTE_PGM_RSRC2.SCRATCH_EN with a zero scratch size");
     }
     // Debug aid: APS5_LDS_SLACK=<dwords> grows every dispatch's LDS allocation by that much, to tell
     // whether a program depends on addresses past its declared allocation.
@@ -87,25 +87,27 @@ ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers&
         std::min(((rsrc2 >> 15u) & 0x1FFu) * 128u + ldsSlack, 16384u),
         {((rsrc2 >> 7u) & 0x1u) != 0, ((rsrc2 >> 8u) & 0x1u) != 0, ((rsrc2 >> 9u) & 0x1u) != 0},
         ((rsrc2 >> 10u) & 0x1u) != 0,
-        ((rsrc2 >> 11u) & 0x3u) + 1u
+        ((rsrc2 >> 11u) & 0x3u) + 1u,
+        {},
+        scratchDwords
     };
 }
 
 ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram) {
-    const auto inControl = read(context, spiPsInControl, RegisterBank::Context);
+    const auto inControl = nullProgram ? 0u : read(context, spiPsInControl, RegisterBank::Context);
     const auto inputNum = inControl & 0x3Fu;
     if (inputNum > 32u) {
         throw std::runtime_error("AGC graphics: SPI_PS_IN_CONTROL input count exceeds 32");
     }
-    const auto ena = nullProgram ? readOr(context, spiPsInputEna, RegisterBank::Context, defaultPixelInputs) : read(context, spiPsInputEna, RegisterBank::Context);
-    const auto addr = nullProgram ? readOr(context, spiPsInputAddr, RegisterBank::Context, defaultPixelInputs) : read(context, spiPsInputAddr, RegisterBank::Context);
+    const auto ena = nullProgram ? defaultPixelInputs : read(context, spiPsInputEna, RegisterBank::Context);
+    const auto addr = nullProgram ? defaultPixelInputs : read(context, spiPsInputAddr, RegisterBank::Context);
     const auto activeInputs = ena & addr;
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputBit;
     constexpr std::uint32_t knownMask = PixelInputBit(PixelInput::PerspectiveSample) | PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::PerspectiveCentroid) |
         PixelInputBit(PixelInput::LinearSample) | PixelInputBit(PixelInput::LinearCenter) | PixelInputBit(PixelInput::LinearCentroid) |
         PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY) | PixelInputBit(PixelInput::PositionZ) | PixelInputBit(PixelInput::PositionW) |
-        PixelInputBit(PixelInput::FrontFace) | PixelInputBit(PixelInput::Ancillary);
+        PixelInputBit(PixelInput::FrontFace) | PixelInputBit(PixelInput::Ancillary) | PixelInputBit(PixelInput::LineStipple) | PixelInputBit(PixelInput::PositionFixedPoint);
     if ((activeInputs & ~knownMask) != 0) {
         char message[128];
         std::snprintf(message, sizeof(message), "AGC graphics: unsupported SPI_PS_INPUT_ENA/ADDR bit combination (ena 0x%x addr 0x%x)", ena, addr);
@@ -115,14 +117,14 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     for (std::uint32_t i = 0; i < inputNum; ++i) {
         interpolatorSettings[i] = read(context, spiPsInputCntl0 + i, RegisterBank::Context);
     }
-    const auto shaderControl = read(context, dbShaderControl, RegisterBank::Context);
+    const auto shaderControl = nullProgram ? 0u : read(context, dbShaderControl, RegisterBank::Context);
     // Bits 9 and 11 are EXEC_ON_HIER_FAIL and ALPHA_TO_MASK_DISABLE on GFX10; neither changes what the
     // recompiled pixel shader computes.
     const auto conservativeZExport = (shaderControl >> 13u) & 0x3u;
     if (conservativeZExport == 3u) {
         throw std::runtime_error("AGC graphics: DB_SHADER_CONTROL.CONSERVATIVE_Z_EXPORT uses the reserved value 3");
     }
-    const auto colFormat = nullProgram ? readOr(context, spiShaderColFormat, RegisterBank::Context, 0u) : read(context, spiShaderColFormat, RegisterBank::Context);
+    const auto colFormat = nullProgram ? 0u : read(context, spiShaderColFormat, RegisterBank::Context);
     std::array<std::uint8_t, 8> targetOutputMode{};
     for (std::uint32_t i = 0; i < 8u; ++i) {
         targetOutputMode[i] = static_cast<std::uint8_t>((colFormat >> (4u * i)) & 0xFu);
@@ -154,18 +156,21 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable,
         .executeOnNoop = ((shaderControl >> 10u) & 0x1u) != 0,
         .conservativeZExport = static_cast<ShaderRecompiler::ConservativeZExport>(conservativeZExport),
+        .orderedPixelShader = ((shaderControl >> 16u) & 0x1u) != 0,
         .targetOutputMode = targetOutputMode,
-        .targetExportMapping = exportMappings
+        .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings
     };
 }
 
-ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads) {
+ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads, bool staticAbi) {
+    if (header.empty()) return {};
     if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: shader header is smaller than the fixed AGC header");
     Shader shader;
     std::memcpy(&shader, header.data(), sizeof(Shader));
     ShaderRecompiler::ShaderVertexStageInfo info{};
     if (shader.user_data == nullptr) throw std::runtime_error("AGC graphics: missing AGC user-data header");
-    const auto userDataHeader = _readHeaderPod<ShaderUserData>(header, headerAddress, shader.user_data);
+    constexpr auto userDataBytes = offsetof(ShaderUserData, sharp_resource_count) + sizeof(ShaderUserData{}.sharp_resource_count);
+    const auto userDataHeader = _readHeaderPod<ShaderUserData>(header, headerAddress, shader.user_data, userDataBytes);
     if (userDataHeader.direct_resource_count > ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT) throw std::runtime_error("AGC graphics: AGC direct-resource count exceeds the known resource domain");
     std::array<std::uint16_t, ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT> directOffsets{};
     directOffsets.fill(ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET);
@@ -188,14 +193,21 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
     _readHeaderArray(header, headerAddress, shader.input_semantics, shader.num_input_semantics, semantics.data());
     const auto attribTableAddr = static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexAttribReg)]) | (static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexAttribReg) + 1u]) << 32u);
     const auto bufferTableAddr = static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexBufferReg)]) | (static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexBufferReg) + 1u]) << 32u);
-    if (attribTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex attribute table address");
-    if (bufferTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex buffer table address");
+    if (!staticAbi && attribTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex attribute table address");
+    if (!staticAbi && bufferTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex buffer table address");
     info.fetchEmbedded = true;
     info.fetchAttribReg = static_cast<std::uint32_t>(vertexAttribReg);
     info.fetchBufferReg = static_cast<std::uint32_t>(vertexBufferReg);
     for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
         const auto& semantic = semantics[i];
         if (semantic.static_vb_index == 1 || semantic.static_attribute == 1) throw std::runtime_error("AGC graphics: statically bound vertex attributes are not implemented");
+        if (staticAbi) {
+            auto& destination = info.resourcesDst.at(info.resourcesNum++);
+            destination.registerStart = static_cast<std::int32_t>(semantic.hardware_mapping);
+            destination.registersNum = static_cast<std::int32_t>(semantic.size_in_elements);
+            destination.attrId = static_cast<std::int32_t>(semantic.semantic);
+            continue;
+        }
         std::array<std::byte, 4> attribWordBytes{};
         const auto attribWordAddress = attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u;
         AgcDriver::GuestMemory::Read(attribWordAddress, attribWordBytes, 4);

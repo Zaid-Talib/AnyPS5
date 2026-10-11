@@ -8,6 +8,9 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <atomic>
 #include <stdexcept>
 #include "prx/libc/include/Shutdown.hpp"
@@ -106,6 +109,13 @@ extern "C" {
         std::fprintf(stderr, "[libc] _Exit(%d) called from %p\n", code, __builtin_return_address(0));
         std::fflush(stderr);
     }
+    LibcTerminate_nid_no_patch(code);
+}
+
+[[noreturn]] void LibcTerminate_nid_no_patch(int code) {
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
     std::_Exit(code);
 }
 
@@ -113,6 +123,7 @@ extern "C" {
     exitRequested.store(true);
     if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
     LibcRunShutdown_nid_postfix();
+    CxaFinalize_nid_no_patch(nullptr);
     std::exit(code);
 }
 
@@ -183,6 +194,13 @@ int APS5_VABI at_quick_exit_nid_postfix(GuestExitCallback func) {
     }
     for (auto it = callbacks.rbegin(); it != callbacks.rend(); ++it) (*it)();
     _Exit_nid_postfix(status);
+}
+
+int APS5_VABI daemon_nid_postfix(int noChdir, int noClose) {
+    (void)noChdir;
+    (void)noClose;
+    NotImplemented_nid_no_patch("daemon: forking into the background");
+    return -1;
 }
 
 }

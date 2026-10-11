@@ -1,10 +1,13 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -103,6 +106,19 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
     return false;
 }
 
+void Driver::readRegisterLists(Submission& submission) {
+    submission.registerLists.clear();
+    for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
+        const auto header = submission.commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        try {
+            submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header))));
+        } catch (const std::exception& error) {
+            throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": " + error.what());
+        }
+    }
+}
+
 void Driver::waitForFlipRoom(const Submission& submission) {
     for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
         if (submission.commands[cursor] != FlipPacketHeader) continue;
@@ -115,6 +131,34 @@ void Driver::waitForFlipRoom(const Submission& submission) {
         }
         output->WaitForFlipRoom();
     }
+}
+
+bool Driver::awaitsTitle(std::uint64_t awaited) const {
+    return runningWorkers.load(std::memory_order_acquire) == 0 && orderHolders.load(std::memory_order_acquire) == 0 && !completionsPending() && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, 4);
+}
+
+void Driver::noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited) {
+    if (queue != 0 || flipHolders.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire) || !awaitsTitle(awaited)) return;
+    std::lock_guard lock(mutex);
+    queue0AwaitsTitle.store(true, std::memory_order_release);
+    changed.notify_all();
+}
+
+void Driver::holdFlipBehindWorker(const Submission& submission) {
+    if (submission.queue != 0 || onWorkerThread()) return;
+    bool flips = false;
+    for (std::size_t cursor = 0; cursor < submission.commands.size() && !flips; cursor += Pm4::PacketWords(submission.commands[cursor])) flips = submission.commands[cursor] == FlipPacketHeader;
+    if (!flips) return;
+    std::unique_lock lock(mutex);
+    flipHolders.fetch_add(1, std::memory_order_acq_rel);
+    changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    flipHolders.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void Driver::releaseFlipHold() {
+    std::lock_guard lock(mutex);
+    flipsAhead.fetch_sub(1, std::memory_order_acq_rel);
+    if (flipHolders.load(std::memory_order_acquire) != 0) changed.notify_all();
 }
 
 void Driver::reserveOutputs(Submission& submission) {
@@ -141,6 +185,7 @@ void Driver::reserveOutputs(Submission& submission) {
 }
 
 void Driver::executeRewindTail(const Submission& stalled) {
+    PerformanceTimer timing("Driver.Rewind");
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
@@ -152,14 +197,20 @@ void Driver::executeRewindTail(const Submission& stalled) {
         while ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
             CheckFailure();
             checkStopping();
+            noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
             PollSleep();
         }
     }
     Submission tail{};
     tail.queue = stalled.queue;
+    if (APS5_ENABLE_TIMING_LOG) tail.receivedAt = std::chrono::steady_clock::now();
     copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
+    if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
     validate(tail, stalled.rewindTail);
+    readRegisterLists(tail);
+    if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(tail);
+    if (APS5_ENABLE_TIMING_LOG) tail.roomReadyAt = std::chrono::steady_clock::now();
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -169,10 +220,13 @@ void Driver::executeRewindTail(const Submission& stalled) {
         tail.serial = stalled.serial;
         tail.received = ++eventSerial;
     }
+    if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
+    timing.Finish();
     execute(tail);
 }
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
+    const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < 0x58), "unsupported compute queue");
     GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
@@ -180,6 +234,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     require(descriptor.flags == 0, "nonzero submission flags are not implemented");
     Submission submission{};
     submission.queue = queue;
+    submission.receivedAt = receivedAt;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(queue);
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -189,8 +244,13 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         copyCommands(submission, descriptor.addr, descriptor.dw_num);
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
+    if (APS5_ENABLE_TIMING_LOG) submission.copiedAt = std::chrono::steady_clock::now();
     validate(submission, descriptor.addr);
+    readRegisterLists(submission);
+    if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(submission);
+    holdFlipBehindWorker(submission);
+    if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
     const auto validated = profile ? std::chrono::steady_clock::now() : start;
@@ -211,6 +271,11 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
             costs.copyNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>((copied - start) + (now - validated)).count());
         }
+        if (APS5_ENABLE_TIMING_LOG) submission.enqueuedAt = std::chrono::steady_clock::now();
+        if (queue == 0 && !submission.flips.empty()) {
+            submission.holdsFlip = true;
+            flipsAhead.fetch_add(1, std::memory_order_acq_rel);
+        }
         enqueue(std::move(submission));
         ++accepted;
     }
@@ -218,6 +283,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
 }
 
 void Driver::SuspendPoint() {
+    const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     require(!onWorkerThread(), "worker cannot suspend itself");
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -228,6 +294,7 @@ void Driver::SuspendPoint() {
     boundary.suspend = true;
 
     boundary.queue = 0;
+    boundary.receivedAt = receivedAt;
     boundary.enqueuedAt = std::chrono::steady_clock::now();
     enqueue(std::move(boundary));
     ++accepted;
@@ -268,6 +335,7 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
     if (blocked) runningWorkers.fetch_sub(1, std::memory_order_acq_rel);
     else runningWorkers.fetch_add(1, std::memory_order_acq_rel);
     if (queue == 0) queue0Awaited.store(blocked ? awaited : 0, std::memory_order_release);
+    if (queue == 0 && !blocked) queue0AwaitsTitle.store(false, std::memory_order_release);
     if (blocked && orderHolders.load(std::memory_order_acquire) != 0) {
         std::lock_guard lock(mutex);
         changed.notify_all();
@@ -281,7 +349,17 @@ void Driver::enqueue(Submission submission) {
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
-    if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] { run(queue); });
+    if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] {
+        char role[32];
+        std::snprintf(role, sizeof(role), "queue 0x%x worker", queue);
+        try {
+            RaiseWorkerThreadPriority(role);
+        } catch (...) {
+            ReportFailure(std::current_exception());
+            return;
+        }
+        run(queue);
+    });
 }
 
 void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {

@@ -17,16 +17,15 @@ struct BufferResource {
     std::uint32_t source = 0;
     std::uint32_t firstUsePc = 0;
     std::uint32_t maxByteExtent = 0;
-    std::uint32_t packedStride = 0;
-    IrBufferFormat descriptorFormat = IrBufferFormat::Invalid;
-    std::uint32_t descriptorSwizzle = 0x00000facu;
     std::uint32_t imageAlias = NoImageAlias;
     bool read = false;
     bool written = false;
     bool atomic = false;
     bool formatted = false;
+    bool descriptorFormatted = false;
+    std::uint32_t formattedReadMask = 0;
     bool scalar = false;
-    bool empty = false;
+    std::uint8_t typedAlignment = 1;
 
     bool operator==(const BufferResource& other) const = default;
 };
@@ -34,6 +33,9 @@ struct BufferResource {
 enum class ImageMipMode { None, DynamicStorage };
 
 namespace EmulatedCompare {
+inline constexpr std::uint32_t NativeOffsetUnsupported = 1u << 29u;
+inline constexpr std::uint32_t Unsupported = 1u << 31u;
+inline constexpr std::uint32_t RequiresSingleLevel = 1u << 30u;
 inline constexpr std::uint32_t Enabled = 1u << 0u;
 inline constexpr std::uint32_t FunctionShift = 1u;
 inline constexpr std::uint32_t Linear = 1u << 4u;
@@ -74,9 +76,20 @@ struct ImageResource {
     bool cube = false;
     bool r128 = false;
     bool srgbDecode = false;
+    bool srgbDecodeCompatible = true;
+    std::uint32_t srgbDecodeFormats = 0u;
     bool depthBits = false;
     bool depthUnorm16 = false;
     bool packed = false;
+    bool fmaskCompatible = true;
+    bool depthBitsCompatible = true;
+    bool constantSwizzle = false;
+    bool constantSwizzleCompatible = true;
+    bool flatVolumeCompatible = true;
+    bool flatLineCompatible = true;
+    bool foldTexelOffsetsOnly = false;
+    std::uint32_t byElements = 0;
+    std::uint32_t byComponents = 0;
     IrBufferFormat packedFormat = IrBufferFormat::Invalid;
     std::uint32_t emulatedCompare = 0;
     std::uint32_t indirectRoot = NoIndirectImage;
@@ -103,14 +116,22 @@ inline bool ImageSampleExplicitLod(std::uint32_t flags, IrShaderStage stage) {
 }
 
 struct SamplerResource {
+    static constexpr std::uint32_t NoCopy = std::numeric_limits<std::uint32_t>::max();
+
     std::uint32_t source = 0;
     std::uint32_t firstUsePc = 0;
+    std::uint32_t copyOf = NoCopy;
     bool forcePointFiltering = false;
     bool depthCompare = false;
     std::uint8_t uses = 0;
+    bool foldTexelOffsetsOnly = false;
 
     bool operator==(const SamplerResource& other) const = default;
 };
+
+inline bool FoldsTexelOffsets(const SamplerResource& sampler) {
+    return (sampler.uses & SamplerUseOffset) != 0u && (sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset)) == 0u && !sampler.depthCompare;
+}
 
 struct SampledResourcePair {
     std::uint32_t image = 0;

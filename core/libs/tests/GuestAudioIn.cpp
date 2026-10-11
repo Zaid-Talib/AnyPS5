@@ -5,10 +5,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
 extern "C" {
+int APS5_VABI sceAudioInInit();
 int APS5_VABI sceAudioInOpen(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
 int APS5_VABI sceAudioInInput(int, void*);
 int APS5_VABI sceAudioInGetSilentState(int);
@@ -43,7 +45,7 @@ void TestValidation() {
 }
 
 void TestCapture() {
-    const auto path = std::filesystem::temp_directory_path() / "anyps5_audio_in_capture.raw";
+    const auto path = std::filesystem::temp_directory_path() / ("anyps5_audio_in_capture-" + std::to_string(std::random_device{}()) + ".raw");
     std::vector<std::int16_t> recorded(256 * 2 * 4);
     for (std::size_t i = 0; i < recorded.size(); ++i) recorded[i] = static_cast<std::int16_t>(i * 7 - 3000);
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(recorded.data()), static_cast<std::streamsize>(recorded.size() * 2));
@@ -97,6 +99,7 @@ void TestNoDevice() {
 
 int main(int argc, char** argv) {
     Require(argc == 2);
+    Require(sceAudioInInit() == 0);
     if (std::strcmp(argv[1], "capture") == 0) TestCapture();
     else TestNoDevice();
 }

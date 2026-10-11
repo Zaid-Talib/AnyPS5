@@ -63,8 +63,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.inputAddr);
             for (const bool flag : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.perspectiveCentroid, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.linearCentroid, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop}) mix(flag);
             mix(static_cast<std::uint64_t>(pixel.conservativeZExport));
+            mix(pixel.orderedPixelShader);
             for (const auto value : pixel.targetOutputMode) mix(value);
             for (const auto value : pixel.targetExportMapping) mix(value);
+            for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
+            mix(pixel.dualSourceBlend);
+            mix(pixel.alphaToCoverage);
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);
@@ -86,6 +90,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 for (std::size_t i = 0; !miss && i < programs.size(); ++i) {
                     if (roles[i] == Role::GeometryBack) continue;
                     ++stageValidations;
+                    cursor = Graphics::StagePushOffset(cursor, programs[i].binary.stage, localDevice->GraphicsPipelineLibraries());
                     const auto& variants = entry->stages[i];
                     auto outcome = EntryOutcome::Differing;
                     bool anyLayout = false;

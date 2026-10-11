@@ -205,6 +205,19 @@ struct ModuleSegmentInfo {
     std::int32_t prot;
 };
 
+struct ModuleInfo {
+    std::uint64_t st_size;
+    char name[256];
+    ModuleSegmentInfo segments[4];
+    std::uint32_t segment_count;
+    std::uint8_t fingerprint[20];
+};
+static_assert(offsetof(ModuleInfo, name) == 0x8);
+static_assert(offsetof(ModuleInfo, segments) == 0x108);
+static_assert(offsetof(ModuleInfo, segment_count) == 0x148);
+static_assert(offsetof(ModuleInfo, fingerprint) == 0x14C);
+static_assert(sizeof(ModuleInfo) == 0x160);
+
 struct ModuleInfoEx {
     std::uint64_t st_size;
     char name[256];
@@ -532,6 +545,13 @@ struct Audio3dOpenParameters {
     std::uint32_t buffer_mode;
     std::uint32_t pad;
     std::uint32_t num_beds;
+};
+
+struct Audio3dAttribute {
+    std::uint32_t attribute_id;
+    std::uint32_t pad;
+    const void* value;
+    std::uint64_t value_size;
 };
 
 using AudioPropagationHandle = std::uint64_t;
@@ -1219,6 +1239,9 @@ using NetCtlCallback = void (*)(int, void*);
 struct HttpEpoll {};
 using HttpEpollHandle = HttpEpoll*;
 using HttpsCallback = int (*)(int, unsigned int, void* const*, int, void*);
+using HttpRedirectCallback = int (*)(int, std::int32_t, std::int32_t*, const char*, void*);
+using HttpCookieRecvCallback = int (*)(int, const char*, const char*, std::uint64_t, void*);
+using HttpAuthInfoCallback = int (*)(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*);
 
 struct HttpNBEvent { std::uint8_t opaque[64]; };
 
@@ -1255,6 +1278,18 @@ struct NpTitleId { char data[13]; char pad[3]; };
 struct NpTitleSecret { std::uint8_t data[128]; };
 struct NpContentRestriction { std::uint8_t opaque[128]; };
 struct NpOnlineId { char data[17]; char pad[3]; };
+
+struct SharePlayConnectionInfoA {
+    std::int32_t status;
+    std::int32_t mode;
+    NpOnlineId hostOnlineId;
+    NpOnlineId visitorOnlineId;
+    std::uint64_t hostAccountId;
+    std::uint64_t visitorAccountId;
+    std::int32_t hostUserId;
+    std::int32_t visitorUserId;
+};
+static_assert(sizeof(SharePlayConnectionInfoA) == 72 && offsetof(SharePlayConnectionInfoA, hostAccountId) == 48 && offsetof(SharePlayConnectionInfoA, hostUserId) == 64);
 struct NpId { NpOnlineId online_id; std::uint8_t opaque[4]; };
 struct NpCreateAsyncRequestParameter { std::uint8_t opaque[64]; };
 struct NpCheckPremiumParameter { std::uint8_t opaque[64]; };
@@ -1272,6 +1307,10 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
     NpUnifiedEntitlementLabel entitlement_label;
     std::uint32_t package_type;
     std::uint32_t download_status;
+};
+
+struct NpEntitlementAccessEntitlementKey {
+    std::uint8_t data[16];
 };
 
 
@@ -1383,7 +1422,7 @@ struct SaveDataMountInfo {
 };
 
 struct SceSaveDataTitleId { char data[10]; char pad[2]; };
-struct SceSaveDataDirName { char data[33]; char pad[3]; };
+struct SceSaveDataDirName { char data[32]; };
 struct SaveDataSearchInfo { std::uint8_t opaque[128]; };
 struct SaveDataMemoryData { void* buf; std::size_t buf_size; std::size_t offset; };
 
@@ -1820,6 +1859,19 @@ struct VideoOutOutputStatus {
     std::uint64_t reserved[3] = {};
 };
 
+struct VideoOutResolutionStatus {
+    std::uint32_t fullWidth = 0;
+    std::uint32_t fullHeight = 0;
+    std::uint32_t paneWidth = 0;
+    std::uint32_t paneHeight = 0;
+    std::uint64_t refreshRate = 0;
+    float screenSizeInInch = 0.0f;
+    std::uint16_t flags = 0;
+    std::uint16_t reserved0 = 0;
+    std::uint32_t reserved1[3] = {};
+};
+static_assert(sizeof(VideoOutResolutionStatus) == 48 && offsetof(VideoOutResolutionStatus, refreshRate) == 16 && offsetof(VideoOutResolutionStatus, screenSizeInInch) == 24);
+
 struct VideoOutOutputOptions { std::uint32_t internalData[16] = {}; };
 
 struct VideoOutColorSettings {
@@ -1845,12 +1897,6 @@ struct LibcHeapInfo {
 };
 
 using Info = LibcHeapInfo;
-
-#define VA_ARGS \
-    std::uint64_t rdi, std::uint64_t rsi, std::uint64_t rdx, std::uint64_t rcx, \
-    std::uint64_t r8, std::uint64_t r9, std::uint64_t overflow_arg_area, \
-    __m128 xmm0, __m128 xmm1, __m128 xmm2, __m128 xmm3, \
-    __m128 xmm4, __m128 xmm5, __m128 xmm6, __m128 xmm7, ...
 
 struct Packet {
     std::uint32_t* addr;

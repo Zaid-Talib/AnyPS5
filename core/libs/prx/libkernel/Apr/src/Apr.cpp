@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
@@ -29,6 +30,8 @@
 #include <windows.h>
 #endif
 
+extern "C" int* APS5_VABI __error_nid_postfix();
+
 namespace {
 
 constexpr int GUEST_ENOENT = 2;
@@ -39,15 +42,15 @@ struct AprFile {
     std::uint64_t size;
 };
 
-std::mutex g_filesLock;
-std::vector<AprFile> g_files;
-std::unordered_map<std::string, std::uint32_t> g_idsByPath;
+std::mutex& g_filesLock = *new std::mutex();
+std::vector<AprFile>& g_files = *new std::vector<AprFile>();
+std::unordered_map<std::string, std::uint32_t>& g_idsByPath = *new std::unordered_map<std::string, std::uint32_t>();
 
 // File sizes by directory, listed on first use. Titles resolve thousands of package paths at startup,
 // and one size query per path took over 20 s; a listing costs one directory read. Names are compared
 // case-insensitively, like the host file system.
-std::mutex g_directoriesLock;
-std::unordered_map<std::string, std::unordered_map<std::string, std::uint64_t>> g_directories;
+std::mutex& g_directoriesLock = *new std::mutex();
+std::unordered_map<std::string, std::unordered_map<std::string, std::uint64_t>>& g_directories = *new std::unordered_map<std::string, std::unordered_map<std::string, std::uint64_t>>();
 
 std::string _foldCase(std::string text) {
     for (auto& character : text) {
@@ -98,7 +101,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
 }
 
 int _fail(int guestErrno) {
-    errno = guestErrno;
+    *__error_nid_postfix() = guestErrno;
     return -1;
 }
 
@@ -130,6 +133,7 @@ constexpr int SCE_KERNEL_ERROR_ENOENT = static_cast<int>(0x80020002);
 
 int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint32_t* ids, uint64_t* sizes, int* results) {
     if (!paths || !ids) return _fail(GUEST_EINVAL);
+    std::uint32_t resolvedCount = 0;
     for (uint32_t index = 0; index < count; ++index) {
         const std::string path = prefix ? (paths[index] ? std::string(prefix) + paths[index] : std::string()) : (paths[index] ? std::string(paths[index]) : std::string());
         const bool resolved = !path.empty() && _resolve(path.c_str(), &ids[index], sizes ? &sizes[index] : nullptr);
@@ -137,9 +141,10 @@ int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint
             ids[index] = INVALID_FILE_ID;
             if (sizes) sizes[index] = 0;
         }
+        if (resolved) ++resolvedCount;
         if (results) results[index] = resolved ? 0 : SCE_KERNEL_ERROR_ENOENT;
     }
-    return 0;
+    return static_cast<int>(resolvedCount);
 }
 
 void _readFile(const Apr::ReadFileCommand& command) {
@@ -164,7 +169,7 @@ void _writeAddress(const Apr::WriteAddressCommand& command) {
 
 std::array<std::atomic<std::uint32_t>, 256> g_counters{};
 
-std::mutex g_counterWrites;
+std::mutex& g_counterWrites = *new std::mutex();
 
 std::uint32_t _counter(std::uint32_t index) {
     return g_counters[index % g_counters.size()].load(std::memory_order_acquire);
@@ -244,6 +249,7 @@ TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
 
 constexpr std::uint64_t AmmRangeBytes = 32ull << 30;
 constexpr int GuestMapFixed = 0x10;
+constexpr int GuestMapNoOverwrite = 0x80;
 
 struct AmmPage {
     std::uint64_t physical;
@@ -263,14 +269,18 @@ struct AmmState {
 };
 
 AmmState& _amm() {
-    static AmmState state;
+    static auto& state = *new AmmState();
     return state;
 }
 
 std::uintptr_t _ammBase(AmmState& state) {
     if (state.base == 0) {
-        void* address = nullptr;
-        if (DoReserveVirtual(&address, 2 * AmmRangeBytes, 0, 0x200000) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
+        std::uintptr_t arenaBase = 0;
+        std::size_t arenaBytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+        if (arenaBase == 0 || arenaBytes < 2 * AmmRangeBytes) throw std::runtime_error("AMM: the guest address space arena cannot hold the virtual address range");
+        void* address = reinterpret_cast<void*>(arenaBase + arenaBytes - 2 * AmmRangeBytes);
+        if (DoReserveVirtual(&address, 2 * AmmRangeBytes, GuestMapFixed | GuestMapNoOverwrite, 0) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
         state.base = reinterpret_cast<std::uintptr_t>(address);
     }
     return state.base;
@@ -520,6 +530,15 @@ void _execute(const Apr::CommandBufferObject& buffer) {
         if (cursor + sizeof(Apr::CommandHeader) > buffer.offset) throw std::runtime_error("APR: truncated command buffer");
         Apr::CommandHeader header;
         std::memcpy(&header, buffer.base + cursor, sizeof(header));
+        if ((static_cast<std::uint32_t>(header.opcode) & 0xffu) == static_cast<std::uint32_t>(Apr::Opcode::CompactReadFileGather)) {
+            if (sizeof(Apr::CompactReadFileGatherCommand) > buffer.offset - cursor) throw std::runtime_error("APR: truncated compact gather command");
+            const auto command = _read<Apr::CompactReadFileGatherCommand>(buffer, cursor);
+            const auto offset = static_cast<std::uint64_t>(command.opcodeAndOffsetHigh >> 8u) << 32u | command.offsetLow;
+            if (offset >= 0x10000000000ull) throw std::runtime_error("APR: malformed compact gather offset");
+            _readResolved(Apr::Opcode::ReadFileGather, Apr::ReadFileCommand{{}, 0, 0, 0, static_cast<std::uint64_t>(command.sizeMinusOne) + 1u, offset}, read);
+            cursor += sizeof(command);
+            continue;
+        }
         if (header.bytes < sizeof(header) || cursor + header.bytes > buffer.offset) throw std::runtime_error("APR: malformed command");
         switch (header.opcode) {
         case Apr::Opcode::Nop:
@@ -585,12 +604,12 @@ void _execute(const Apr::CommandBufferObject& buffer) {
                 return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).load(std::memory_order_acquire);
             };
             const std::uint64_t reference = (command.reference & command.mask) << unused;
-            while (!_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            while (!_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) PreciseSleepUs(50);
             break;
         }
         case Apr::Opcode::WriteKernelEventQueue: {
             const auto command = _read<Apr::WriteKernelEventQueueCommand>(buffer, cursor);
-            EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_USER, reinterpret_cast<void*>(command.data));
+            EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
             break;
         }
         case Apr::Opcode::WriteAddressFromTimeCounter: {
@@ -640,7 +659,7 @@ void AmmVirtualAddressRanges_nid_no_patch(std::uint64_t* start, std::uint64_t* e
 }
 
 std::uint32_t AmmSubmit_nid_no_patch(void* base, std::uint32_t bytes) {
-    _execute(Apr::CommandBufferObject{static_cast<std::uint8_t*>(base), bytes, bytes, 0, Apr::BufferType::Generic, 0});
+    _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, static_cast<std::uint8_t*>(base)});
     auto& last = _amm().lastSubmit;
     std::uint32_t id = last.fetch_add(1) + 1;
     while (id == 0) id = last.fetch_add(1) + 1;
@@ -656,6 +675,7 @@ int APS5_VABI sceKernelAprResolveFilepathsToIds(const char** paths, uint32_t cou
     if (!paths || !ids) return _fail(GUEST_EINVAL);
     for (uint32_t index = 0; index < count; ++index) {
         if (!_resolve(paths[index], &ids[index], nullptr)) {
+            ids[index] = INVALID_FILE_ID;
             if (error_index) *error_index = index;
             return _fail(GUEST_ENOENT);
         }
@@ -667,6 +687,8 @@ int APS5_VABI sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, 
     if (!paths || !ids || !sizes) return _fail(GUEST_EINVAL);
     for (uint32_t index = 0; index < count; ++index) {
         if (!_resolve(paths[index], &ids[index], &sizes[index])) {
+            ids[index] = INVALID_FILE_ID;
+            if (sizes) sizes[index] = 0;
             if (error_index) *error_index = index;
             return _fail(GUEST_ENOENT);
         }
@@ -679,6 +701,8 @@ int APS5_VABI sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(const char
     for (uint32_t index = 0; index < count; ++index) {
         const std::string path = paths[index] ? std::string(prefix) + paths[index] : std::string();
         if (path.empty() || !_resolve(path.c_str(), &ids[index], sizes ? &sizes[index] : nullptr)) {
+            ids[index] = INVALID_FILE_ID;
+            if (sizes) sizes[index] = 0;
             if (error_index) *error_index = index;
             return _fail(GUEST_ENOENT);
         }
@@ -704,7 +728,7 @@ int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
 
 int APS5_VABI sceKernelAprSubmitCommandBuffer(const Apr::CommandBufferObject* buffer, uint32_t priority) {
     (void)priority;
-    if (!buffer || buffer->type != Apr::BufferType::Apr) return _fail(GUEST_EINVAL);
+    if (!buffer) return _fail(GUEST_EINVAL);
     _execute(*buffer);
     return 0;
 }

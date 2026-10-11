@@ -31,7 +31,8 @@ MemoryInfo sharedMemoryInfoFromInstruction(const RdnaInstruction& inst) {
 }
 
 bool TranslationContext::dsAtomic(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
-    const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    memory.flushDenormals = sharedFloatFlush(opcode);
     const IrU32 address = readU32(inst.source0);
     const IrU32 value = readU32(inst.source1);
     IrValue& active = ir.GetExec();
@@ -194,8 +195,41 @@ bool TranslationContext::dsWrite2(const RdnaInstruction& inst) {
     return true;
 }
 
-bool TranslationContext::dsAtomic2(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
+bool TranslationContext::dsSrc2(const RdnaInstruction& inst, IrOpcode opcode) {
+    if (inst.gds) {
+        throw std::runtime_error("GDS src2 operations are not supported");
+    }
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    const IrU32 address = readU32(inst.source0);
+    MemoryInfo source = memory;
+    source.offset = memory.secondaryOffset;
+    source.secondaryOffset = 0u;
+    IrValue* value = loadSharedU32(1u, address, source, inst.programCounter);
+    MemoryInfo target = memory;
+    target.secondaryOffset = 0u;
+    IrValue& active = ir.GetExec();
+    (void)ir.Emit(opcode, IrOpcodeType(opcode), {&address.Value(), value, &active}, addMemoryInfo(target, inst.programCounter));
+    return true;
+}
+
+bool TranslationContext::sharedFloatFlush(IrOpcode opcode) const {
+    switch (opcode) {
+    case IrOpcode::SharedAtomicFMin32:
+    case IrOpcode::SharedAtomicFMax32:
+    case IrOpcode::SharedAtomicCmpstF32:
+        return !floatMode.has_value() || ((floatMode->floatMode >> 4u) & 1u) == 0u;
+    case IrOpcode::SharedAtomicFMin64:
+    case IrOpcode::SharedAtomicFMax64:
+    case IrOpcode::SharedAtomicCmpstF64:
+        return floatMode.has_value() && ((floatMode->floatMode >> 6u) & 1u) == 0u;
+    default:
+        return false;
+    }
+}
+
+bool TranslationContext::dsAtomic2(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
+    MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    memory.flushDenormals = sharedFloatFlush(opcode);
     const IrU32 address = readU32(inst.source0);
     const IrU32 data0 = readU32(inst.source1);
     const IrU32 data1 = readU32(inst.source2);
@@ -209,7 +243,8 @@ bool TranslationContext::dsAtomic64(const RdnaInstruction& inst, IrOpcode opcode
     if (inst.gds) {
         throw std::runtime_error("64-bit GDS atomics are not supported");
     }
-    const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    memory.flushDenormals = sharedFloatFlush(opcode);
     const IrU32 address = readU32(inst.source0);
     const IrU64 data0 = readU64(inst.source1);
     IrValue& active = ir.GetExec();
@@ -221,6 +256,29 @@ bool TranslationContext::dsAtomic64(const RdnaInstruction& inst, IrOpcode opcode
         old = &ir.Emit(opcode, IrOpcodeType(opcode), {&address.Value(), &data0.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
     }
     if (returnsValue) writeOperand(inst.destination, old);
+    return true;
+}
+
+bool TranslationContext::dsCondxchg32(const RdnaInstruction& inst) {
+    if (inst.gds) {
+        throw std::runtime_error("DS conditional exchange GDS mode is not supported");
+    }
+    MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    memory.dataDwords = 1u;
+    memory.componentCount = 1u;
+    const auto data = readU32Pair(inst.source1);
+    const IrU32 address = readU32(inst.source0);
+    IrValue& active = ir.GetExec();
+    std::array<IrValue*, 2> old{};
+    for (std::uint32_t index = 0u; index < 2u; ++index) {
+        IrValue& enabled = ir.UGreaterThan(data[index].Value(), ir.Constant(0x7fffffffu));
+        IrValue& mask = ir.Select(enabled, ir.Constant(0xffffffffu), ir.Constant(0u));
+        IrValue& value = ir.Select(enabled, ir.BitwiseAnd(data[index].Value(), ir.Constant(0x7fffffffu)), ir.Constant(0u));
+        memory.offset = inst.memoryOffset + index * 4u;
+        old[index] = &ir.Emit(IrOpcode::SharedAtomicMskor32, IrType::U32, {&address.Value(), &mask, &value, &active}, addMemoryInfo(memory, inst.programCounter));
+    }
+    writeOperand(inst.destination, old[0]);
+    writeOperand(offsetOperand(inst.destination, 1u), old[1]);
     return true;
 }
 

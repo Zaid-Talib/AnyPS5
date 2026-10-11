@@ -40,7 +40,7 @@ std::uint32_t available(const CommandBuffer& buffer, const char* function) {
     const auto bottom = reinterpret_cast<std::uintptr_t>(buffer.bottom);
     const auto top = reinterpret_cast<std::uintptr_t>(buffer.top);
     const auto up = reinterpret_cast<std::uintptr_t>(buffer.cursor_up);
-    const auto down = reinterpret_cast<std::uintptr_t>(buffer.cursor_down);
+    const auto down = buffer.cursor_down != nullptr ? reinterpret_cast<std::uintptr_t>(buffer.cursor_down) : top;
     Require(((bottom | top | up | down) & 3u) == 0, function, "misaligned command buffer");
     Require(bottom <= up && up <= down && down <= top, function, "invalid command buffer cursors");
     Require(bottom != 0 || top == 0, function, "null command buffer storage");
@@ -85,7 +85,7 @@ void ValidatePacket(const std::uint32_t* packet, std::uint32_t opcode, std::uint
 }
 
 std::uint32_t* WriteNop(CommandBuffer* buffer, std::uint32_t count, const char* function) {
-    const auto header = Header(0x10u, count);
+    const auto header = count == 1 ? 0xffff1000u : Header(0x10u, count);
     auto* packet = Allocate(buffer, count, function);
     packet[0] = header;
     std::fill_n(packet + 1, count - 1u, 0u);
